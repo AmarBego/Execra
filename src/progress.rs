@@ -1,4 +1,4 @@
-//! Progress is the single most load-bearing type. See SCHEMA.md.
+//! Progress values are emitted by interpreters and surfaced through `Event`.
 
 use serde::{Deserialize, Serialize};
 

@@ -26,7 +26,7 @@ impl EventStream {
 impl EventStream {
     /// Returns the next event, or `None` when the channel closes.
     /// Lagged events are silently skipped; callers that need a complete
-    /// history should query persisted state via `Execra::job`.
+    /// history should query persisted state via `Runtime::job`.
     pub async fn next(&mut self) -> Option<Event> {
         loop {
             match self.rx.next().await {

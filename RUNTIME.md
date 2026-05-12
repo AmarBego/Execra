@@ -1,22 +1,71 @@
 # Runtime API
 
-The public surface a host application uses to spawn, observe, cancel, and persist jobs. Pair with [SCHEMA.md](SCHEMA.md) for the event/data model and [INTERPRETER.md](INTERPRETER.md) for output mapping.
+The public surface for spawning, observing, cancelling, and optionally
+persisting external process jobs. Pair this with [INTERPRETER.md](INTERPRETER.md)
+for output mapping.
 
----
+## Runtime
 
-## Shell-agnostic core, ergonomic shell helpers
-
-Execra has no opinion about what runs inside a process. `Command::new` accepts any program path; the runtime treats every job identically.
+`Runtime` is the cloneable job runtime. Construct it once at application
+startup and share clones with command handlers.
 
 ```rust
-rt.spawn(Command::new("bash").args(["-c", "make build"])).await?;
-rt.spawn(Command::new("pwsh").args(["-NoProfile", "-Command", "scoop install git"])).await?;
-rt.spawn(Command::new("zsh").args(["-c", "./deploy.sh"])).await?;
-rt.spawn(Command::new("awk").args(["-f", "report.awk", "data.txt"])).await?;
-rt.spawn(Command::new("./my-binary").args(["--flag"])).await?;
+use execra::{Command, Runtime};
+
+let rt = Runtime::new();
+let outcome = rt.spawn(Command::new("echo").arg("hi"))?.await;
+assert!(outcome.is_success());
 ```
 
-For GUI apps that need common shell envelopes without reimplementing platform branching, `Command` also provides explicit helpers:
+`Runtime::new()` is synchronous, infallible, and in-memory. It creates no
+SQLite database, no raw log directory, and no retention worker.
+
+Opt into persistence and tuning with the builder:
+
+```rust
+let rt = Runtime::builder()
+    .history("./jobs.sqlite")
+    .log_dir("./raw")
+    .raw_output(execra::RawOutputPolicy::Persist)
+    .max_concurrent(4)
+    .build()?;
+```
+
+Core methods:
+
+```rust
+impl Runtime {
+    pub fn new() -> Self;
+    pub fn builder() -> RuntimeBuilder;
+
+    pub fn spawn(&self, cmd: Command) -> Result<JobHandle, Error>;
+    pub fn cancel(&self, id: JobId) -> Result<(), Error>;
+
+    pub fn recent(&self, n: usize) -> Vec<Job>;
+    pub fn running(&self) -> Vec<JobId>;
+    pub fn job(&self, id: JobId) -> Option<Job>;
+    pub fn jobs(&self) -> JobsQuery;
+
+    pub fn subscribe(&self) -> EventStream;
+    pub fn subscribe_job(&self, id: JobId) -> EventStream;
+}
+```
+
+`spawn` is synchronous: it schedules the driver task and returns a `JobHandle`.
+It must be called from inside a Tokio runtime.
+
+## Command
+
+`Command::new(program)` takes a program and args. It does not parse shell
+strings.
+
+```rust
+Command::new("git").args(["status", "--short"]);
+Command::new("scoop").args(["install", "git"]);
+Command::new("./tool").arg("--json");
+```
+
+Shell helpers are explicit:
 
 ```rust
 Command::shell("echo hello");       // cmd /C on Windows, sh -c elsewhere
@@ -26,227 +75,210 @@ Command::powershell("Get-ChildItem");
 Command::pwsh("Get-ChildItem");
 ```
 
-This is a deliberate boundary: `Command::new` never parses shell strings, while the helper constructors make shell use explicit and portable.
-
----
-
-## `Execra`
-
-The runtime handle. One per host application (typically constructed at startup, held in app state, shared across callers).
+Other builder methods cover env, cwd, stdin, label, tags, timeout, hidden
+window behavior, and an optional interpreter:
 
 ```rust
-pub struct Execra { /* … */ }
-
-impl Execra {
-    pub async fn open(config: Config) -> Result<Self, Error>;
-
-    pub async fn spawn(&self, cmd: Command) -> Result<JobHandle, Error>;
-
-    pub fn cancel(&self, id: JobId) -> Result<(), Error>;
-    pub async fn job(&self, id: JobId) -> Option<Job>;
-    pub fn jobs(&self) -> JobsQuery;          // filter / paginate persisted jobs
-
-    pub fn subscribe(&self) -> EventStream;                  // all events
-    pub fn subscribe_job(&self, id: JobId) -> EventStream;   // one job
-}
+Command::new("tool")
+    .args(["--scan", "target"])
+    .env("NO_COLOR", "1")
+    .cwd("./work")
+    .label("Scanning target")
+    .tags(["scan".to_string()])
+    .timeout(std::time::Duration::from_secs(60))
+    .interpreter(MyInterpreter);
 ```
 
-`Config` carries the sqlite path, log directory, default concurrency limits, and platform-specific knobs (Windows `CREATE_NO_WINDOW`, Unix process-group setup).
+Output bytes are decoded with lossy UTF-8 at the runtime boundary. Invalid
+byte sequences are replaced with U+FFFD instead of dropping output handling.
 
----
+## JobHandle
 
-## `Command`
-
-Thin builder over the OS process abstraction. No shell awareness.
-
-```rust
-pub struct Command { /* … */ }
-
-impl Command {
-    pub fn new(program: impl Into<OsString>) -> Self;
-    pub fn shell(script: impl Into<String>) -> Self;        // cmd /C or sh -c
-    pub fn system_shell(script: impl Into<String>) -> Self; // alias for shell
-    pub fn cmd(script: impl Into<String>) -> Self;
-    pub fn sh(script: impl Into<String>) -> Self;
-    pub fn powershell(script: impl Into<String>) -> Self;
-    pub fn pwsh(script: impl Into<String>) -> Self;
-
-    pub fn arg(self, a: impl Into<OsString>) -> Self;
-    pub fn args<I, S>(self, args: I) -> Self
-        where I: IntoIterator<Item = S>, S: Into<OsString>;
-
-    pub fn env(self, key: impl Into<OsString>, val: impl Into<OsString>) -> Self;
-    pub fn envs<I, K, V>(self, vars: I) -> Self
-        where I: IntoIterator<Item = (K, V)>, K: Into<OsString>, V: Into<OsString>;
-    pub fn env_clear(self) -> Self;
-
-    pub fn cwd(self, dir: impl Into<PathBuf>) -> Self;
-    pub fn stdin(self, mode: StdinMode) -> Self;
-
-    pub fn label(self, label: impl Into<String>) -> Self;
-    pub fn tags(self, tags: impl IntoIterator<Item = String>) -> Self;
-    pub fn interpreter(self, i: impl Interpreter + 'static) -> Self;
-
-    pub fn timeout(self, d: Duration) -> Self;
-    pub fn hide_window(self, yes: bool) -> Self;   // Windows: CREATE_NO_WINDOW; default true on Windows
-}
-
-pub enum StdinMode {
-    Null,                         // default
-    Inherit,                      // pass-through (rare)
-    Piped(Vec<u8>),               // write bytes, then close
-}
-```
-
-`label` is the human-readable title surfaced in events. `tags` are user-defined strings useful for filtering (`tags: ["scoop", "cleanup"]`).
-
-Output bytes are decoded with lossy UTF-8 at the runtime boundary. Invalid byte sequences are replaced with U+FFFD instead of dropping the line or terminating output handling.
-
----
-
-## `JobHandle`
-
-The thing `spawn` returns. Implements `Future<Output = Outcome>` so callers can `.await` completion. Carries the `JobId` so callers who want to keep running (UI streaming) can stash it and subscribe.
+`Runtime::spawn` returns a `JobHandle`.
 
 ```rust
-pub struct JobHandle { /* … */ }
-
-impl JobHandle {
-    pub fn id(&self) -> JobId;
-    pub fn cancel(&self) -> Result<(), Error>;
-    pub fn subscribe(&self) -> EventStream;
-}
-
-impl Future for JobHandle {
-    type Output = Outcome;
-    /* polls the underlying job to finalization */
-}
-```
-
-This is the dual-mode pattern that collapses "headless" and "UI" callers into one code path:
-
-```rust
-// Headless: just await the outcome.
-let outcome = rt.spawn(cmd).await?.await;
-match outcome {
-    Outcome::Succeeded { .. } => trigger_next_step().await,
-    Outcome::Failed { reason, .. } => log::warn!("failed: {reason:?}"),
-    Outcome::Cancelled { .. } => {}
-}
-
-// UI: stash the id, subscribe to events, render.
-let handle = rt.spawn(cmd).await?;
+let mut handle = rt.spawn(cmd)?;
 let id = handle.id();
 let mut events = handle.subscribe();
+
 tokio::spawn(async move {
-    while let Some(ev) = events.next().await { forward_to_webview(ev); }
+    while let Some(event) = events.next().await {
+        // render, log, or forward
+        let _ = event;
+    }
 });
-state.current_job = Some(id);
+
+let outcome = handle.await;
 ```
 
-Same `spawn`. Two consumption patterns. No second function.
+`JobHandle` implements `Future<Output = Outcome>`. The same spawn call serves
+headless and UI callers: await the handle for the verdict, subscribe to the
+handle or runtime for live events, or do both.
 
----
+## Tauri Plugin
+
+With the `tauri` feature enabled, Execra exposes a first-class Tauri plugin.
+
+```rust
+tauri::Builder::default()
+    .plugin(execra::tauri::init())
+    .run(tauri::generate_context!())
+    .unwrap();
+```
+
+Use `init_with(runtime)` to pass a preconfigured runtime:
+
+```rust
+tauri::Builder::default()
+    .plugin(execra::tauri::init_with(
+        execra::Runtime::builder()
+            .history("./jobs.sqlite")
+            .max_concurrent(2)
+            .build()
+            .expect("open runtime"),
+    ));
+```
+
+`ExecraExt` adds `app.execra()` to Tauri managers:
+
+```rust
+use execra::tauri::ExecraExt;
+
+#[tauri::command]
+fn run_tool(app: tauri::AppHandle, args: Vec<String>) -> Result<execra::JobId, String> {
+    app.execra()
+        .task(execra::Command::new("scrcpy").args(args))
+        .channel("scrcpy:log")
+        .spawn_tracked()
+        .map_err(|e| e.to_string())
+}
+```
+
+`RuntimeRef::task(cmd)` returns a `TaskBuilder`:
+
+```rust
+app.execra()
+    .task(cmd)
+    .label("Installing git")
+    .tag("scoop")
+    .interpreter(ScoopInterpreter)
+    .channel("operation")
+    .on_created(|app, job| {
+        // record the current backend job id
+        let _ = (app, job);
+    })
+    .on_output(|app, stream, line| {
+        // mirror output into app-owned Rust state
+        let _ = (app, stream.as_str(), line);
+    })
+    .on_interpreter_error(|_app, interpreter, error, line| {
+        log::warn!("interpreter error in {interpreter}: {error} ({line:?})");
+    })
+    .on_finalized(|app, outcome| {
+        // clear backend state or trigger follow-up work
+        let _ = (app, outcome);
+    })
+    .await;
+```
+
+`.channel(name)` emits every serialized `Event` on one frontend channel.
+`.observe(callback)` runs Rust-side observers against the same event stream;
+`.on_created`, `.on_output`, `.on_interpreter_error`, and `.on_finalized` are
+typed conveniences over `observe`.
+For `.spawn()` the forwarder runs in the background; when the task builder is
+awaited directly, Execra waits for observers/channel forwarding to see
+`Finalized` before returning the `Outcome`.
+
+## Event Subscription
+
+`EventStream` is an async stream of `Event`.
+
+```rust
+let mut all = rt.subscribe();
+let mut one_job = rt.subscribe_job(id);
+
+while let Some(event) = one_job.next().await {
+    // ...
+}
+```
+
+Subscribers receive events from the moment they subscribe forward. Historical
+state comes from `recent`, `running`, `job`, or `jobs`. Lagged broadcast events
+are skipped; callers that need exact history should use persistence and query
+the stored job/events.
 
 ## Cancellation
 
-`rt.cancel(id)` or `handle.cancel()` requests termination of a specific job. There is no global cancel.
+`rt.cancel(id)` or `handle.cancel()` requests termination of one job.
 
 Semantics:
-- Cancellation **kills the process group**, not just the leader PID. On Unix this means `setpgid` at spawn and `kill(-pgid, SIGTERM)` followed by `SIGKILL` after a grace period. On Windows this means each job is assigned to a Win32 Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Practical consequence: when scoop install gets cancelled, the aria2 child dies too.
-- Cancellation is async. `cancel()` returns immediately; the job transitions to `Outcome::Cancelled` once the OS confirms termination.
-- A cancelled job's `Finalized` event still fires. Subscribers don't need a separate "was it cancelled" check.
-- Cancelling a job that's already finalized is a no-op (returns `Ok(())`), not an error.
 
----
+* Cancellation kills the process group, not just the leader process.
+* On Unix, Execra uses `setpgid` and sends signals to the process group.
+* On Windows, Execra assigns the child to a Win32 Job Object.
+* `cancel()` returns immediately; the job finalizes as `Outcome::Cancelled`
+  after the OS reports termination and pipes drain.
+* Cancelling an already-finalized job is a no-op.
 
-## Termination order
+## Termination Order
 
-Pipe EOF and process exit are independent OS events. A naive runtime that triggers `on_exit` on `child.wait()` alone can lose the final lines still buffered in the pipe at exit time , including the summary or known-error line that decides how the job is classified.
+Pipe EOF and process exit are independent OS events. Execra waits for stdout
+EOF, stderr EOF, and process exit before calling `Interpreter::on_exit`.
 
-Execra guarantees this order:
+Order:
 
-1. The runtime concurrently drives three futures: stdout-to-EOF, stderr-to-EOF, and `child.wait()`.
-2. Every line drained from the pipes is dispatched to `on_line` in stream order.
-3. Only after **all three** futures resolve does the runtime call `Interpreter::on_exit` with the captured `ExitCode`.
-4. The runtime then computes `Outcome` from exit code + interpreter evidence and emits `Finalized`.
+1. `JobCreated`
+2. `JobStarted`
+3. zero or more output/interpreter events
+4. `Exited`
+5. `Interpreter::on_exit`
+6. `Finalized`
 
-Concretely, this means:
-
-- A summary line printed milliseconds before exit is always delivered to the interpreter before `on_exit` runs.
-- A process that closes stdout early and continues working still has its later exit code respected; `on_exit` is not called early.
-- Cancellation kills the process group, then awaits the same three futures so cancelled jobs still finalize cleanly.
-
----
-
-## Event subscription
-
-`EventStream` is an async stream of `Event` (see [SCHEMA.md](SCHEMA.md)). Backed by a broadcast channel.
-
-- Subscribers receive events from the moment they subscribe forward. Historical events come from `rt.job(id)` / `rt.jobs()` queries, not from the live stream.
-- Multiple subscribers per job are allowed. The Tauri plugin and a CLI tail can subscribe simultaneously.
-- A slow subscriber lagging the channel buffer is dropped (with a `Lagged` notification) rather than blocking event production. UIs should refetch state via `rt.job(id)` after a lag.
-
----
+This lets interpreters see final output lines before classifying the outcome.
 
 ## Persistence
 
-Two stores, one runtime. The split keeps the SQLite database small and queryable while letting raw output stay cheap.
-
-**SQLite , events, jobs, metadata.**
-- Job records (command, label, tags, timestamps, state, outcome).
-- Interpreted events: `PhaseEntered`, `ProgressUpdated`, `Finding`, `Warning`, `KnownError`, `Summary`, `Exited`, `Finalized`, etc.
-- Queryable via `rt.jobs()` (filter by state, tag, time range).
-
-**Flat files , raw output.**
-- One file per job: `<log_dir>/<job_id>.log` (or `.log.gz` after finalization, configurable).
-- Append-only during the job; closed and optionally gzipped on `Finalized`.
-- `OutputAppended` events surfacing to subscribers are sourced from the flat file. The wire shape is identical regardless of storage , consumers don't know the difference.
-
-This split exists because a `cargo build` or `npm install` can emit 10K+ output lines. Inserting that many rows into SQLite per job destroys write throughput and balloons the database. Flat files are cheap to append, cheap to gzip, cheap to delete, and trivial to tail.
-
-### Config
+Persistence is opt-in.
 
 ```rust
-pub struct Config {
-    pub db_path: PathBuf,                       // SQLite location
-    pub log_dir: PathBuf,                       // per-job flat-file directory
-    pub raw_output: RawOutputPolicy,            // see below
-    pub retention: RetentionPolicy,             // separate for events vs raw logs
-    pub max_concurrent: usize,                  // default: num_cpus
-    pub default_grace_period: Duration,         // SIGTERM → SIGKILL on cancel
-}
+Runtime::new(); // no disk writes
+```
 
+Builder knobs:
+
+```rust
+Runtime::builder()
+    .history("./jobs.sqlite")          // SQLite job/event history
+    .log_dir("./raw")                  // raw stdout/stderr files
+    .raw_output(RawOutputPolicy::Persist)
+    .retention(RetentionPolicy::default())
+    .max_concurrent(4)
+    .default_grace_period(Duration::from_secs(5))
+    .build()?;
+```
+
+Raw output policies:
+
+```rust
 pub enum RawOutputPolicy {
-    Persist,                  // default: flat file per job
-    PersistGzipOnFinalize,    // flat during run, gzip on Finalized
-    MemoryOnly,               // ring buffer; events still stream live
-    Disabled,                 // drop raw lines after dispatching to interpreter
-}
-
-pub struct RetentionPolicy {
-    pub keep_events_for: Duration,    // SQLite event rows; default 30 days
-    pub keep_raw_for: Duration,       // flat log files; default 7 days
-    pub pinned_tag: String,           // jobs with this tag are never pruned
+    Persist,
+    #[cfg(feature = "gzip")]
+    PersistGzipOnFinalize,
+    MemoryOnly,
+    Disabled,
 }
 ```
 
-`Command::timeout(d)` enforces a wall-clock deadline from successful process spawn. On timeout the runtime kills the process group, emits the raw `Exited` event when the OS reports termination, and finalizes as `Outcome::Failed { reason: FailureReason::Timeout, .. }`. User cancellation remains distinct and finalizes as `Outcome::Cancelled`.
+`Disabled` is the default. Live `OutputAppended` events still stream and
+interpreters still see lines, but raw output is not retained after broadcast.
 
-`Disabled` is useful for noisy CLIs whose output isn't worth keeping (compile spam, large `tar` operations) and for sensitive jobs whose raw output shouldn't hit disk. Even with `Disabled`, the event stream is unaffected , interpreted events still persist; subscribers still see `OutputAppended` live; nothing is written to the flat file.
+When `history(path)` is set, Execra opens SQLite and persists job snapshots and
+events. When `log_dir(path)` is set, raw output can be retained separately from
+the event database.
 
-### Resumability
+## Non-goals
 
-A job that was `Running` when the process died at shutdown is resurrected as `Failed { reason: SpawnFailed { error: "host process exited" } }` on next startup, *not* re-run. v1 guarantees the *record* survives; resumability of partially-completed work is a v0.2 concern.
-
----
-
-## What Execra does not do
-
-Pinning these explicitly so the runtime stays small:
-
-- **Shell parsing.** No string splitting, no quoting rules, no environment interpolation. Pass `program + args`, or invoke a shell yourself.
-- **In-process work.** Filesystem operations, in-memory transformations, anything that isn't a child process. Use plain Rust; don't pretend it's a job.
-- **Job composition / dependencies.** v1 has no DAG, no "run B after A succeeds." Callers chain with `.await`. Composition is a v0.2 concern at earliest.
-- **Distributed execution.** Single host, single process. No cross-machine scheduling.
-- **Stdin interactivity.** A job can be fed a static byte buffer via `StdinMode::Piped`, but Execra does not model interactive prompts beyond emitting `PromptDetected`. Handling the prompt is the host app's job.
+Execra does not parse shell strings, run in-process work, define job DAGs,
+perform distributed scheduling, or ship a catalogue of tool-specific
+interpreters. Callers chain jobs with `.await` and provide interpreters for the
+CLIs they understand.

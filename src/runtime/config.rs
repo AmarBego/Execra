@@ -1,22 +1,22 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Internal knobs the driver needs at spawn time. Constructed by
+/// [`RuntimeBuilder`](super::RuntimeBuilder); never authored by consumers.
 #[derive(Debug, Clone)]
-pub struct Config {
-    pub db_path: PathBuf,
-    pub log_dir: PathBuf,
+pub(crate) struct RuntimeConfig {
+    pub log_dir: Option<PathBuf>,
     pub raw_output: RawOutputPolicy,
     pub retention: RetentionPolicy,
     pub max_concurrent: usize,
     pub default_grace_period: Duration,
 }
 
-impl Default for Config {
+impl Default for RuntimeConfig {
     fn default() -> Self {
-        Config {
-            db_path: PathBuf::from("execra.db"),
-            log_dir: PathBuf::from("execra-logs"),
-            raw_output: RawOutputPolicy::Persist,
+        RuntimeConfig {
+            log_dir: None,
+            raw_output: RawOutputPolicy::Disabled,
             retention: RetentionPolicy::default(),
             max_concurrent: std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -26,12 +26,18 @@ impl Default for Config {
     }
 }
 
+/// How raw stdout/stderr is retained for finished jobs. `Disabled` is the
+/// default — raw lines stream through the event bus and are dropped after.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawOutputPolicy {
+    /// Append every line to `<log_dir>/<job_id>.log` as the job runs.
     Persist,
+    /// As `Persist`, but gzip the file when the job finalizes.
     #[cfg(feature = "gzip")]
     PersistGzipOnFinalize,
+    /// Keep the last 1024 lines in a per-job in-memory ring buffer.
     MemoryOnly,
+    /// Discard raw output past the event broadcast.
     Disabled,
 }
 

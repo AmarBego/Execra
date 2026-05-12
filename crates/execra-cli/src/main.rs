@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use execra::{
-    Command, Config, Event, Execra, Job, JobId, JobState, Outcome, RawOutputPolicy, Stream,
+    Command, Event, Job, JobId, JobState, Outcome, RawOutputPolicy, Runtime, Stream,
 };
 
 #[derive(Debug, Parser)]
@@ -68,24 +68,28 @@ struct TailArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = Config {
-        db_path: cli.db,
-        log_dir: cli.log_dir,
-        ..Config::default()
-    };
-
     match cli.command {
-        CliCommand::Run(args) => run(config, args).await,
-        CliCommand::Ls(args) => ls(config, args).await,
-        CliCommand::Logs(args) => logs(config, args),
-        CliCommand::Tail(args) => tail(config, args).await,
+        CliCommand::Run(args) => run(cli.db, cli.log_dir, args).await,
+        CliCommand::Ls(args) => ls(cli.db, args),
+        CliCommand::Logs(args) => logs(cli.log_dir, args),
+        CliCommand::Tail(args) => tail(cli.db, args),
     }
 }
 
-async fn run(mut config: Config, args: RunArgs) -> Result<()> {
-    if args.no_raw_log {
-        config.raw_output = RawOutputPolicy::Disabled;
-    }
+fn open_rt(db: PathBuf, log_dir: PathBuf, raw: RawOutputPolicy) -> Result<Runtime> {
+    Ok(Runtime::builder()
+        .history(db)
+        .log_dir(log_dir)
+        .raw_output(raw)
+        .build()?)
+}
+
+async fn run(db: PathBuf, log_dir: PathBuf, args: RunArgs) -> Result<()> {
+    let policy = if args.no_raw_log {
+        RawOutputPolicy::Disabled
+    } else {
+        RawOutputPolicy::Persist
+    };
     let (program, rest) = args
         .command
         .split_first()
@@ -95,8 +99,8 @@ async fn run(mut config: Config, args: RunArgs) -> Result<()> {
         cmd = cmd.timeout(Duration::from_millis(ms));
     }
 
-    let rt = Execra::open(config).await?;
-    let mut handle = rt.spawn(cmd).await?;
+    let rt = open_rt(db, log_dir, policy)?;
+    let mut handle = rt.spawn(cmd)?;
     let job_id = handle.id();
     let mut events = handle.subscribe();
     let mut finalized_seen = false;
@@ -128,8 +132,8 @@ async fn run(mut config: Config, args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-async fn ls(config: Config, args: LsArgs) -> Result<()> {
-    let rt = Execra::open(config).await?;
+fn ls(db: PathBuf, args: LsArgs) -> Result<()> {
+    let rt = Runtime::builder().history(db).build()?;
     let mut query = rt.jobs().limit(args.limit);
     if let Some(tag) = args.tag {
         query = query.with_tag(tag);
@@ -137,7 +141,7 @@ async fn ls(config: Config, args: LsArgs) -> Result<()> {
     if let Some(state) = args.state {
         query = query.with_state(parse_job_state(&state)?);
     }
-    let jobs = query.run(&rt).await?;
+    let jobs = query.run(&rt)?;
     if args.json {
         for job in jobs {
             println!("{}", serde_json::to_string(&job)?);
@@ -150,10 +154,10 @@ async fn ls(config: Config, args: LsArgs) -> Result<()> {
     Ok(())
 }
 
-fn logs(config: Config, args: JobArgs) -> Result<()> {
+fn logs(log_dir: PathBuf, args: JobArgs) -> Result<()> {
     let id = parse_job_id(&args.job)?;
-    let plain = config.log_dir.join(format!("{id}.log"));
-    let gz = config.log_dir.join(format!("{id}.log.gz"));
+    let plain = log_dir.join(format!("{id}.log"));
+    let gz = log_dir.join(format!("{id}.log.gz"));
     if plain.exists() {
         print!("{}", std::fs::read_to_string(plain)?);
         return Ok(());
@@ -169,10 +173,10 @@ fn logs(config: Config, args: JobArgs) -> Result<()> {
     bail!("no raw log found for job {id}");
 }
 
-async fn tail(config: Config, args: TailArgs) -> Result<()> {
+fn tail(db: PathBuf, args: TailArgs) -> Result<()> {
     let id = parse_job_id(&args.job)?;
-    let store = execra::store::Store::open(&config.db_path).await?;
-    let events = store.list_events(id, args.limit).await?;
+    let store = execra::store::Store::open(&db)?;
+    let events = store.list_events(id, args.limit)?;
     for event in events {
         if args.json {
             println!("{}", serde_json::to_string(&event)?);

@@ -2,9 +2,10 @@ use tokio::io::AsyncWriteExt;
 
 use crate::job::JobId;
 
-use super::{Config, RawOutputPolicy};
+use super::{RawOutputPolicy, RuntimeConfig};
 
-pub(super) async fn open_raw_log(job_id: JobId, config: &Config) -> Option<tokio::fs::File> {
+pub(super) async fn open_raw_log(job_id: JobId, config: &RuntimeConfig) -> Option<tokio::fs::File> {
+    let log_dir = config.log_dir.as_ref()?;
     let persist = match config.raw_output {
         RawOutputPolicy::Persist => true,
         #[cfg(feature = "gzip")]
@@ -15,20 +16,20 @@ pub(super) async fn open_raw_log(job_id: JobId, config: &Config) -> Option<tokio
         return None;
     }
 
-    if tokio::fs::create_dir_all(&config.log_dir).await.is_err() {
+    if tokio::fs::create_dir_all(log_dir).await.is_err() {
         return None;
     }
     tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(config.log_dir.join(format!("{job_id}.log")))
+        .open(log_dir.join(format!("{job_id}.log")))
         .await
         .ok()
 }
 
 pub(super) async fn finalize_raw_log(
     job_id: JobId,
-    config: &Config,
+    config: &RuntimeConfig,
     raw_file: &mut Option<tokio::fs::File>,
 ) {
     if let Some(file) = raw_file.as_mut() {
@@ -41,9 +42,12 @@ pub(super) async fn finalize_raw_log(
         if !matches!(config.raw_output, RawOutputPolicy::PersistGzipOnFinalize) {
             return;
         }
+        let Some(log_dir) = config.log_dir.as_ref() else {
+            return;
+        };
 
-        let src = config.log_dir.join(format!("{job_id}.log"));
-        let dst = config.log_dir.join(format!("{job_id}.log.gz"));
+        let src = log_dir.join(format!("{job_id}.log"));
+        let dst = log_dir.join(format!("{job_id}.log.gz"));
         let _ = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
             let mut input = std::fs::File::open(&src)?;
             let output = std::fs::File::create(&dst)?;

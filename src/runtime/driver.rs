@@ -19,7 +19,7 @@ use crate::store::Store;
 
 use super::raw_output::{finalize_raw_log, open_raw_log};
 use super::wait::{spawn_wait_task, WaitOutcome};
-use super::{Config, MemoryRawOutput, RawOutputPolicy, MEMORY_RAW_CAPACITY};
+use super::{MemoryRawOutput, RawOutputPolicy, RuntimeConfig, MEMORY_RAW_CAPACITY};
 
 struct DriverState {
     phase_stack: Vec<Phase>,
@@ -39,8 +39,8 @@ pub(super) async fn drive_job(
     events_tx: broadcast::Sender<Event>,
     outcome_tx: oneshot::Sender<Outcome>,
     snapshot: Arc<Mutex<Job>>,
-    store: Store,
-    config: Config,
+    store: Option<Store>,
+    config: RuntimeConfig,
     permits: Arc<tokio::sync::Semaphore>,
     memory_raw: MemoryRawOutput,
 ) {
@@ -87,13 +87,17 @@ pub(super) async fn drive_job(
                 j.state = JobState::Finalized;
                 j.outcome = Some(outcome.clone());
             });
-            persist_snapshot(&store, &snapshot).await;
+            persist_snapshot(store.as_ref(), &snapshot);
             finalize_raw_log(job_id, &config, &mut raw_file).await;
-            let _ = events_tx.send(Event::Finalized {
-                job: job_id,
-                outcome: outcome.clone(),
-                at: SystemTime::now(),
-            });
+            emit(
+                &events_tx,
+                store.as_ref(),
+                Event::Finalized {
+                    job: job_id,
+                    outcome: outcome.clone(),
+                    at: SystemTime::now(),
+                },
+            );
             let _ = outcome_tx.send(outcome);
             return;
         }
@@ -101,16 +105,20 @@ pub(super) async fn drive_job(
 
     let pid = child.id().unwrap_or(0);
     let proc_group = ProcessGroup::assign(&child);
-    let _ = events_tx.send(Event::JobStarted {
-        job: job_id,
-        pid,
-        at: SystemTime::now(),
-    });
+    emit(
+        &events_tx,
+        store.as_ref(),
+        Event::JobStarted {
+            job: job_id,
+            pid,
+            at: SystemTime::now(),
+        },
+    );
     update_snapshot(&snapshot, |j| {
         j.state = JobState::Running;
         j.started_at = Some(SystemTime::now());
     });
-    persist_snapshot(&store, &snapshot).await;
+    persist_snapshot(store.as_ref(), &snapshot);
 
     if let StdinMode::Piped(bytes) = stdin {
         if let Some(mut sin) = child.stdin.take() {
@@ -131,6 +139,7 @@ pub(super) async fn drive_job(
         config.default_grace_period,
         cancel.clone(),
         events_tx.clone(),
+        store.clone(),
     );
 
     let mut state = DriverState {
@@ -152,13 +161,13 @@ pub(super) async fn drive_job(
             biased;
             line = next_line(stdout_lines.as_mut()), if !stdout_done => {
                 match line {
-                    Some(Ok(text)) => process_line(job_id, Stream::Stdout, text, &spec, start, &mut state, &mut interpreter, &events_tx, &snapshot, &mut raw_file, &memory_raw, config.raw_output).await,
+                    Some(Ok(text)) => process_line(job_id, Stream::Stdout, text, &spec, start, &mut state, &mut interpreter, &events_tx, store.as_ref(), &snapshot, &mut raw_file, &memory_raw, config.raw_output).await,
                     _ => stdout_done = true,
                 }
             }
             line = next_line(stderr_lines.as_mut()), if !stderr_done => {
                 match line {
-                    Some(Ok(text)) => process_line(job_id, Stream::Stderr, text, &spec, start, &mut state, &mut interpreter, &events_tx, &snapshot, &mut raw_file, &memory_raw, config.raw_output).await,
+                    Some(Ok(text)) => process_line(job_id, Stream::Stderr, text, &spec, start, &mut state, &mut interpreter, &events_tx, store.as_ref(), &snapshot, &mut raw_file, &memory_raw, config.raw_output).await,
                     _ => stderr_done = true,
                 }
             }
@@ -173,12 +182,12 @@ pub(super) async fn drive_job(
                     Ok(outcome) => outcome.status,
                     Err(_) => Err(std::io::Error::other("wait task dropped")),
                 });
-                let _ = events_tx.send(Event::Exited { job: job_id, code: ec, at: SystemTime::now() });
+                emit(&events_tx, store.as_ref(), Event::Exited { job: job_id, code: ec, at: SystemTime::now() });
                 update_snapshot(&snapshot, |j| {
                     j.exit = Some(ec);
                     j.state = JobState::Exited;
                 });
-                persist_snapshot(&store, &snapshot).await;
+                persist_snapshot(store.as_ref(), &snapshot);
             }
         }
     }
@@ -197,23 +206,28 @@ pub(super) async fn drive_job(
         &mut state,
         &mut interpreter,
         &events_tx,
+        store.as_ref(),
         &snapshot,
         &exit_code,
     );
-    exit_open_phases(job_id, &mut state, &events_tx, &snapshot);
+    exit_open_phases(job_id, &mut state, &events_tx, store.as_ref(), &snapshot);
 
     let outcome = compute_outcome(cancel.is_cancelled(), timed_out, exit_code, state);
     update_snapshot(&snapshot, |j| {
         j.state = JobState::Finalized;
         j.outcome = Some(outcome.clone());
     });
-    persist_snapshot(&store, &snapshot).await;
+    persist_snapshot(store.as_ref(), &snapshot);
     finalize_raw_log(job_id, &config, &mut raw_file).await;
-    let _ = events_tx.send(Event::Finalized {
-        job: job_id,
-        outcome: outcome.clone(),
-        at: SystemTime::now(),
-    });
+    emit(
+        &events_tx,
+        store.as_ref(),
+        Event::Finalized {
+            job: job_id,
+            outcome: outcome.clone(),
+            at: SystemTime::now(),
+        },
+    );
     let _ = outcome_tx.send(outcome);
 }
 
@@ -227,6 +241,7 @@ async fn process_line(
     state: &mut DriverState,
     interpreter: &mut Option<Box<dyn Interpreter + Send + 'static>>,
     events_tx: &broadcast::Sender<Event>,
+    store: Option<&Store>,
     snapshot: &Arc<Mutex<Job>>,
     raw_file: &mut Option<tokio::fs::File>,
     memory_raw: &MemoryRawOutput,
@@ -254,6 +269,8 @@ async fn process_line(
             lines.pop_front();
         }
     }
+    // OutputAppended is high-volume; we send to the broadcast but skip
+    // sqlite (Store::insert_event short-circuits it anyway).
     let _ = events_tx.send(Event::OutputAppended {
         job: job_id,
         stream,
@@ -276,22 +293,27 @@ async fn process_line(
                 interp.on_line(&ctx, &line)
             }));
             match res {
-                Ok(evs) => apply_events(evs, job_id, state, events_tx, snapshot),
+                Ok(evs) => apply_events(evs, job_id, state, events_tx, store, snapshot),
                 Err(p) => {
                     state.interp_disabled = true;
-                    let _ = events_tx.send(Event::InterpreterError {
-                        job: job_id,
-                        interpreter: "interpreter".into(),
-                        error: panic_msg(&p),
-                        line: Some(line_for_err),
-                        at: SystemTime::now(),
-                    });
+                    emit(
+                        events_tx,
+                        store,
+                        Event::InterpreterError {
+                            job: job_id,
+                            interpreter: "interpreter".into(),
+                            error: panic_msg(&p),
+                            line: Some(line_for_err),
+                            at: SystemTime::now(),
+                        },
+                    );
                 }
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_on_exit(
     job_id: JobId,
     spec: &CommandSpec,
@@ -299,6 +321,7 @@ fn run_on_exit(
     state: &mut DriverState,
     interpreter: &mut Option<Box<dyn Interpreter + Send + 'static>>,
     events_tx: &broadcast::Sender<Event>,
+    store: Option<&Store>,
     snapshot: &Arc<Mutex<Job>>,
     exit_code: &ExitCode,
 ) {
@@ -315,16 +338,20 @@ fn run_on_exit(
                 interp.on_exit(&ctx, exit_code)
             }));
             match res {
-                Ok(evs) => apply_events(evs, job_id, state, events_tx, snapshot),
+                Ok(evs) => apply_events(evs, job_id, state, events_tx, store, snapshot),
                 Err(p) => {
                     state.interp_disabled = true;
-                    let _ = events_tx.send(Event::InterpreterError {
-                        job: job_id,
-                        interpreter: "interpreter".into(),
-                        error: panic_msg(&p),
-                        line: None,
-                        at: SystemTime::now(),
-                    });
+                    emit(
+                        events_tx,
+                        store,
+                        Event::InterpreterError {
+                            job: job_id,
+                            interpreter: "interpreter".into(),
+                            error: panic_msg(&p),
+                            line: None,
+                            at: SystemTime::now(),
+                        },
+                    );
                 }
             }
         }
@@ -336,6 +363,7 @@ fn apply_events(
     job_id: JobId,
     state: &mut DriverState,
     events_tx: &broadcast::Sender<Event>,
+    store: Option<&Store>,
     snapshot: &Arc<Mutex<Job>>,
 ) {
     for ev in evs {
@@ -351,23 +379,31 @@ fn apply_events(
                 let id = phase.id;
                 state.phase_stack.push(phase);
                 update_snapshot(snapshot, |j| j.current_phase = Some(id));
-                let _ = events_tx.send(Event::PhaseEntered {
-                    job: job_id,
-                    phase: id,
-                    name,
-                    label,
-                    at,
-                });
+                emit(
+                    events_tx,
+                    store,
+                    Event::PhaseEntered {
+                        job: job_id,
+                        phase: id,
+                        name,
+                        label,
+                        at,
+                    },
+                );
             }
             InterpreterEvent::UpdatePhase { label } => {
                 if let Some(top) = state.phase_stack.last_mut() {
                     top.label = Some(label.clone());
-                    let _ = events_tx.send(Event::PhaseUpdated {
-                        job: job_id,
-                        phase: top.id,
-                        label,
-                        at,
-                    });
+                    emit(
+                        events_tx,
+                        store,
+                        Event::PhaseUpdated {
+                            job: job_id,
+                            phase: top.id,
+                            label,
+                            at,
+                        },
+                    );
                 } else {
                     emit_interp_error(
                         job_id,
@@ -375,6 +411,7 @@ fn apply_events(
                         None,
                         at,
                         events_tx,
+                        store,
                     );
                 }
             }
@@ -382,11 +419,15 @@ fn apply_events(
                 if let Some(top) = state.phase_stack.pop() {
                     let new_top = state.phase_stack.last().map(|p| p.id);
                     update_snapshot(snapshot, |j| j.current_phase = new_top);
-                    let _ = events_tx.send(Event::PhaseExited {
-                        job: job_id,
-                        phase: top.id,
-                        at,
-                    });
+                    emit(
+                        events_tx,
+                        store,
+                        Event::PhaseExited {
+                            job: job_id,
+                            phase: top.id,
+                            at,
+                        },
+                    );
                 } else {
                     emit_interp_error(
                         job_id,
@@ -394,57 +435,82 @@ fn apply_events(
                         None,
                         at,
                         events_tx,
+                        store,
                     );
                 }
             }
             InterpreterEvent::Progress { progress } => {
                 let p = progress.normalize();
                 update_snapshot(snapshot, |j| j.progress = p.clone());
-                let _ = events_tx.send(Event::ProgressUpdated {
-                    job: job_id,
-                    progress: p,
-                    at,
-                });
+                emit(
+                    events_tx,
+                    store,
+                    Event::ProgressUpdated {
+                        job: job_id,
+                        progress: p,
+                        at,
+                    },
+                );
             }
             InterpreterEvent::Label { text } => {
                 update_snapshot(snapshot, |j| j.label = Some(text.clone()));
-                let _ = events_tx.send(Event::LabelUpdated {
-                    job: job_id,
-                    label: text,
-                    at,
-                });
+                emit(
+                    events_tx,
+                    store,
+                    Event::LabelUpdated {
+                        job: job_id,
+                        label: text,
+                        at,
+                    },
+                );
             }
             InterpreterEvent::Warning { code, message } => {
-                let _ = events_tx.send(Event::WarningDetected {
-                    job: job_id,
-                    code,
-                    message,
-                    at,
-                });
+                emit(
+                    events_tx,
+                    store,
+                    Event::WarningDetected {
+                        job: job_id,
+                        code,
+                        message,
+                        at,
+                    },
+                );
             }
             InterpreterEvent::KnownError { code, message } => {
                 state.known_error = Some((code.clone(), message.clone()));
-                let _ = events_tx.send(Event::KnownErrorDetected {
-                    job: job_id,
-                    code,
-                    message,
-                    at,
-                });
+                emit(
+                    events_tx,
+                    store,
+                    Event::KnownErrorDetected {
+                        job: job_id,
+                        code,
+                        message,
+                        at,
+                    },
+                );
             }
             InterpreterEvent::Finding { finding } => {
                 state.findings.push(finding.clone());
-                let _ = events_tx.send(Event::FindingEmitted {
-                    job: job_id,
-                    finding,
-                    at,
-                });
+                emit(
+                    events_tx,
+                    store,
+                    Event::FindingEmitted {
+                        job: job_id,
+                        finding,
+                        at,
+                    },
+                );
             }
             InterpreterEvent::Prompt { prompt } => {
-                let _ = events_tx.send(Event::PromptDetected {
-                    job: job_id,
-                    prompt,
-                    at,
-                });
+                emit(
+                    events_tx,
+                    store,
+                    Event::PromptDetected {
+                        job: job_id,
+                        prompt,
+                        at,
+                    },
+                );
             }
             InterpreterEvent::Summary { text } => state.summary = Some(text),
         }
@@ -455,14 +521,19 @@ fn exit_open_phases(
     job_id: JobId,
     state: &mut DriverState,
     events_tx: &broadcast::Sender<Event>,
+    store: Option<&Store>,
     snapshot: &Arc<Mutex<Job>>,
 ) {
     while let Some(top) = state.phase_stack.pop() {
-        let _ = events_tx.send(Event::PhaseExited {
-            job: job_id,
-            phase: top.id,
-            at: SystemTime::now(),
-        });
+        emit(
+            events_tx,
+            store,
+            Event::PhaseExited {
+                job: job_id,
+                phase: top.id,
+                at: SystemTime::now(),
+            },
+        );
     }
     update_snapshot(snapshot, |j| j.current_phase = None);
 }
@@ -537,12 +608,21 @@ fn update_snapshot<F: FnOnce(&mut Job)>(snapshot: &Arc<Mutex<Job>>, f: F) {
     }
 }
 
-async fn persist_snapshot(store: &Store, snapshot: &Arc<Mutex<Job>>) {
+fn persist_snapshot(store: Option<&Store>, snapshot: &Arc<Mutex<Job>>) {
+    let Some(store) = store else { return };
     let job = match snapshot.lock() {
         Ok(g) => g.clone(),
         Err(_) => return,
     };
-    let _ = store.upsert_job(&job).await;
+    let _ = store.upsert_job(&job);
+}
+
+/// Broadcasts an event and, if persistence is enabled, writes it to the store.
+pub(super) fn emit(events_tx: &broadcast::Sender<Event>, store: Option<&Store>, event: Event) {
+    let _ = events_tx.send(event.clone());
+    if let Some(store) = store {
+        let _ = store.insert_event(&event);
+    }
 }
 
 #[cfg(windows)]
@@ -556,34 +636,25 @@ fn configure_hidden_window(cmd: &mut TokioCommand, hide: bool) {
 #[cfg(not(windows))]
 fn configure_hidden_window(_cmd: &mut TokioCommand, _hide: bool) {}
 
-pub(super) fn spawn_store_writer(store: Store, mut rx: broadcast::Receiver<Event>) {
-    tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    let _ = store.insert_event(&event).await;
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            }
-        }
-    });
-}
-
 fn emit_interp_error(
     job: JobId,
     error: impl Into<String>,
     line: Option<String>,
     at: SystemTime,
     events_tx: &broadcast::Sender<Event>,
+    store: Option<&Store>,
 ) {
-    let _ = events_tx.send(Event::InterpreterError {
-        job,
-        interpreter: "interpreter".into(),
-        error: error.into(),
-        line,
-        at,
-    });
+    emit(
+        events_tx,
+        store,
+        Event::InterpreterError {
+            job,
+            interpreter: "interpreter".into(),
+            error: error.into(),
+            line,
+            at,
+        },
+    );
 }
 
 fn from_status(s: &std::process::ExitStatus) -> ExitCode {

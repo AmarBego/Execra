@@ -2,15 +2,18 @@
 //! findings (denormalized for queryability). Raw `OutputAppended` events are
 //! intentionally *not* persisted to SQLite , they belong in flat files
 //! (next pass). High-volume CLIs would balloon the database otherwise.
+//!
+//! All methods are synchronous. The runtime keeps the connection behind a
+//! `std::sync::Mutex` because rusqlite itself is synchronous. Async callers
+//! can invoke these directly; just don't hold the lock across awaits.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection};
 use thiserror::Error;
-use tokio::sync::Mutex;
 
 use crate::event::Event;
 use crate::job::{Job, JobId, JobState};
@@ -44,7 +47,7 @@ pub struct JobsFilter {
 }
 
 impl Store {
-    pub async fn open(path: &Path) -> Result<Self, StoreError> {
+    pub fn open(path: &Path) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
@@ -61,7 +64,7 @@ impl Store {
     }
 
     /// In-memory store, useful for tests.
-    pub async fn open_in_memory() -> Result<Self, StoreError> {
+    pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA_SQL)?;
@@ -70,8 +73,8 @@ impl Store {
         })
     }
 
-    pub async fn upsert_job(&self, job: &Job) -> Result<(), StoreError> {
-        let conn = self.conn.lock().await;
+    pub fn upsert_job(&self, job: &Job) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
         let id = job.id.0.as_bytes().to_vec();
         let command_json = serde_json::to_string(&job.command)?;
         let outcome_json = match &job.outcome {
@@ -110,12 +113,12 @@ impl Store {
         Ok(())
     }
 
-    pub async fn insert_event(&self, event: &Event) -> Result<(), StoreError> {
+    pub fn insert_event(&self, event: &Event) -> Result<(), StoreError> {
         // OutputAppended is high-volume and belongs in flat files.
         if matches!(event, Event::OutputAppended { .. }) {
             return Ok(());
         }
-        let conn = self.conn.lock().await;
+        let conn = self.conn.lock().unwrap();
         let job_id = event.job_id().0.as_bytes().to_vec();
         let kind = event_kind(event);
         let payload = serde_json::to_string(event)?;
@@ -145,8 +148,8 @@ impl Store {
         Ok(())
     }
 
-    pub async fn load_job(&self, id: JobId) -> Result<Option<Job>, StoreError> {
-        let conn = self.conn.lock().await;
+    pub fn load_job(&self, id: JobId) -> Result<Option<Job>, StoreError> {
+        let conn = self.conn.lock().unwrap();
         let id_bytes = id.0.as_bytes().to_vec();
         let mut stmt = conn.prepare(
             "SELECT command_json, label, created_at_ms, started_at_ms, state, \
@@ -189,14 +192,10 @@ impl Store {
         }
     }
 
-    /// Most recent jobs first. Used by `Execra::jobs()` resolution and by the
+    /// Most recent jobs first. Used by `Runtime::jobs()` resolution and by the
     /// CLI's `ls` command.
-    pub async fn list_jobs(
-        &self,
-        limit: usize,
-        filter: &JobsFilter,
-    ) -> Result<Vec<Job>, StoreError> {
-        let conn = self.conn.lock().await;
+    pub fn list_jobs(&self, limit: usize, filter: &JobsFilter) -> Result<Vec<Job>, StoreError> {
+        let conn = self.conn.lock().unwrap();
         let mut sql = String::from(
             "SELECT id, command_json, label, created_at_ms, started_at_ms, state, \
                     exit_code, exit_signal, outcome_json, schema_version FROM jobs",
@@ -270,8 +269,8 @@ impl Store {
         Ok(out)
     }
 
-    pub async fn list_events(&self, job: JobId, limit: usize) -> Result<Vec<Event>, StoreError> {
-        let conn = self.conn.lock().await;
+    pub fn list_events(&self, job: JobId, limit: usize) -> Result<Vec<Event>, StoreError> {
+        let conn = self.conn.lock().unwrap();
         let job_id = job.0.as_bytes().to_vec();
         let mut stmt = conn.prepare(
             "SELECT payload, schema_version FROM events WHERE job_id = ?1 ORDER BY id ASC LIMIT ?2",
@@ -290,9 +289,9 @@ impl Store {
 
     /// Mark every Running/Exited job from a previous process as Failed with
     /// `SpawnFailed { error: "host process exited" }`. Called from
-    /// `Execra::open` per RUNTIME.md's resumability rule.
-    pub async fn resurrect_stranded_jobs(&self) -> Result<usize, StoreError> {
-        let conn = self.conn.lock().await;
+    /// `RuntimeBuilder::build` when history is enabled.
+    pub fn resurrect_stranded_jobs(&self) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
         let outcome = Outcome::Failed {
             reason: crate::outcome::FailureReason::SpawnFailed {
                 error: "host process exited".into(),

@@ -3,23 +3,48 @@
 
 #[cfg(feature = "gzip")]
 use std::io::Read;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use execra::{
-    Command, Config, Context, Execra, ExitCode, Finding, Interpreter, InterpreterEvent as Ev, Job,
-    JobId, JobState, Line, Outcome, Progress, RawOutputPolicy,
+    Command, Context, ExitCode, Finding, Interpreter, InterpreterEvent as Ev, Job, JobId,
+    JobState, Line, Outcome, Progress, RawOutputPolicy, Runtime,
 };
 
 static TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
-fn test_config() -> Config {
+#[derive(Clone)]
+struct TestConfig {
+    db_path: PathBuf,
+    log_dir: PathBuf,
+    raw_output: Option<RawOutputPolicy>,
+    max_concurrent: Option<usize>,
+}
+
+impl TestConfig {
+    fn build(&self) -> Runtime {
+        let mut builder = Runtime::builder()
+            .history(self.db_path.clone())
+            .log_dir(self.log_dir.clone());
+        if let Some(raw_output) = self.raw_output {
+            builder = builder.raw_output(raw_output);
+        }
+        if let Some(max_concurrent) = self.max_concurrent {
+            builder = builder.max_concurrent(max_concurrent);
+        }
+        builder.build().unwrap()
+    }
+}
+
+fn test_config() -> TestConfig {
     let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!("execra-test-{}-{id}", std::process::id()));
-    Config {
+    TestConfig {
         db_path: root.join("execra.db"),
         log_dir: root.join("logs"),
-        ..Config::default()
+        raw_output: None,
+        max_concurrent: None,
     }
 }
 
@@ -71,8 +96,8 @@ fn invalid_utf8_output() -> Command {
 
 #[tokio::test]
 async fn successful_command_succeeds() {
-    let rt = Execra::open(test_config()).await.unwrap();
-    let handle = rt.spawn(echo("hello")).await.unwrap();
+    let rt = test_config().build();
+    let handle = rt.spawn(echo("hello")).unwrap();
     let outcome = handle.await;
     assert!(
         matches!(outcome, Outcome::Succeeded { .. }),
@@ -82,8 +107,8 @@ async fn successful_command_succeeds() {
 
 #[tokio::test]
 async fn invalid_utf8_output_is_lossy_decoded_not_dropped() {
-    let rt = Execra::open(test_config()).await.unwrap();
-    let mut handle = rt.spawn(invalid_utf8_output()).await.unwrap();
+    let rt = test_config().build();
+    let mut handle = rt.spawn(invalid_utf8_output()).unwrap();
     let mut events = handle.subscribe();
     let mut saw_replacement = false;
     while let Some(event) = events.next().await {
@@ -105,8 +130,8 @@ async fn invalid_utf8_output_is_lossy_decoded_not_dropped() {
 
 #[tokio::test]
 async fn non_zero_exit_fails_with_nonzero_exit_reason() {
-    let rt = Execra::open(test_config()).await.unwrap();
-    let handle = rt.spawn(fail()).await.unwrap();
+    let rt = test_config().build();
+    let handle = rt.spawn(fail()).unwrap();
     let outcome = handle.await;
     match outcome {
         Outcome::Failed { reason, .. } => match reason {
@@ -119,10 +144,9 @@ async fn non_zero_exit_fails_with_nonzero_exit_reason() {
 
 #[tokio::test]
 async fn spawn_failure_yields_spawn_failed_outcome() {
-    let rt = Execra::open(test_config()).await.unwrap();
+    let rt = test_config().build();
     let handle = rt
         .spawn(Command::new("definitely-not-a-real-binary-9f8e2"))
-        .await
         .unwrap();
     let outcome = handle.await;
     assert!(matches!(
@@ -136,8 +160,8 @@ async fn spawn_failure_yields_spawn_failed_outcome() {
 
 #[tokio::test]
 async fn cancelled_job_finalizes_as_cancelled() {
-    let rt = Execra::open(test_config()).await.unwrap();
-    let handle = rt.spawn(sleep_forever()).await.unwrap();
+    let rt = test_config().build();
+    let handle = rt.spawn(sleep_forever()).unwrap();
     // Give the child a moment to actually start.
     tokio::time::sleep(Duration::from_millis(100)).await;
     handle.cancel().unwrap();
@@ -152,8 +176,8 @@ async fn cancelled_job_finalizes_as_cancelled() {
 
 #[tokio::test]
 async fn cancelling_finalized_job_is_ok() {
-    let rt = Execra::open(test_config()).await.unwrap();
-    let handle = rt.spawn(echo("done")).await.unwrap();
+    let rt = test_config().build();
+    let handle = rt.spawn(echo("done")).unwrap();
     let id = handle.id();
     let outcome = handle.await;
     assert!(
@@ -166,11 +190,11 @@ async fn cancelling_finalized_job_is_ok() {
 #[tokio::test]
 async fn max_concurrent_serializes_process_execution() {
     let mut config = test_config();
-    config.max_concurrent = 1;
-    let rt = Execra::open(config).await.unwrap();
+    config.max_concurrent = Some(1);
+    let rt = config.build();
     let start = std::time::Instant::now();
-    let first = rt.spawn(sleep_millis(350)).await.unwrap();
-    let second = rt.spawn(sleep_millis(350)).await.unwrap();
+    let first = rt.spawn(sleep_millis(350)).unwrap();
+    let second = rt.spawn(sleep_millis(350)).unwrap();
     let first = first.await;
     let second = second.await;
     assert!(matches!(first, Outcome::Succeeded { .. }), "got {first:?}");
@@ -186,10 +210,9 @@ async fn max_concurrent_serializes_process_execution() {
 
 #[tokio::test]
 async fn timed_out_job_fails_with_timeout_reason() {
-    let rt = Execra::open(test_config()).await.unwrap();
+    let rt = test_config().build();
     let handle = rt
         .spawn(sleep_forever().timeout(Duration::from_millis(100)))
-        .await
         .unwrap();
     let outcome = tokio::time::timeout(Duration::from_secs(10), handle)
         .await
@@ -232,10 +255,9 @@ impl Interpreter for CollectFinding {
 
 #[tokio::test]
 async fn interpreter_findings_persist_into_outcome() {
-    let rt = Execra::open(test_config()).await.unwrap();
+    let rt = test_config().build();
     let handle = rt
         .spawn(echo("ALERT something happened").interpreter(CollectFinding))
-        .await
         .unwrap();
     let outcome = handle.await;
     match outcome {
@@ -266,10 +288,9 @@ impl Interpreter for PanicOnce {
 
 #[tokio::test]
 async fn interpreter_panic_does_not_kill_job() {
-    let rt = Execra::open(test_config()).await.unwrap();
+    let rt = test_config().build();
     let handle = rt
         .spawn(echo("first line").interpreter(PanicOnce { fired: false }))
-        .await
         .unwrap();
     let outcome = handle.await;
     // The process still exits 0 even though the interpreter panicked.
@@ -300,8 +321,8 @@ async fn known_error_makes_failed_carry_known_error_reason() {
             }
         }
     }
-    let rt = Execra::open(test_config()).await.unwrap();
-    let handle = rt.spawn(fail().interpreter(ClaimKnownError)).await.unwrap();
+    let rt = test_config().build();
+    let handle = rt.spawn(fail().interpreter(ClaimKnownError)).unwrap();
     let outcome = handle.await;
     match outcome {
         Outcome::Failed {
@@ -315,14 +336,13 @@ async fn known_error_makes_failed_carry_known_error_reason() {
 #[tokio::test]
 async fn completed_job_survives_reopen_and_jobs_query_runs() {
     let config = test_config();
-    let rt = Execra::open(config.clone()).await.unwrap();
+    let rt = config.clone().build();
     let handle = rt
         .spawn(
             echo("persist me")
                 .label("persistent")
                 .tags(vec!["persist".to_string()]),
         )
-        .await
         .unwrap();
     let id = handle.id();
     let outcome = handle.await;
@@ -331,17 +351,15 @@ async fn completed_job_survives_reopen_and_jobs_query_runs() {
         "got {outcome:?}"
     );
 
-    let reopened = Execra::open(config).await.unwrap();
-    let job = reopened.job(id).await.expect("persisted job should load");
+    let reopened = config.build();
+    let job = reopened.job(id).expect("persisted job should load");
     assert_eq!(job.state, JobState::Finalized);
     assert_eq!(job.label.as_deref(), Some("persistent"));
 
     let jobs = reopened
         .jobs()
         .with_tag("persist")
-        .run(&reopened)
-        .await
-        .unwrap();
+        .run(&reopened).unwrap();
     assert!(
         jobs.iter().any(|j| j.id == id),
         "persisted job missing from query"
@@ -351,16 +369,14 @@ async fn completed_job_survives_reopen_and_jobs_query_runs() {
 #[tokio::test]
 async fn jobs_query_filters_by_tag_state_and_created_time() {
     let config = test_config();
-    let rt = Execra::open(config).await.unwrap();
+    let rt = config.build();
     let before = SystemTime::now() - Duration::from_secs(1);
     let keep = rt
         .spawn(echo("keep").tags(vec!["keep".to_string()]))
-        .await
         .unwrap();
     let keep_id = keep.id();
     let skip = rt
         .spawn(echo("skip").tags(vec!["skip".to_string()]))
-        .await
         .unwrap();
     let skip_id = skip.id();
     assert!(matches!(keep.await, Outcome::Succeeded { .. }));
@@ -374,9 +390,7 @@ async fn jobs_query_filters_by_tag_state_and_created_time() {
         .created_after(before)
         .created_before(after)
         .limit(10)
-        .run(&rt)
-        .await
-        .unwrap();
+        .run(&rt).unwrap();
     assert!(jobs.iter().any(|j| j.id == keep_id));
     assert!(!jobs.iter().any(|j| j.id == skip_id));
 }
@@ -384,7 +398,7 @@ async fn jobs_query_filters_by_tag_state_and_created_time() {
 #[tokio::test]
 async fn open_marks_stranded_running_jobs_failed() {
     let config = test_config();
-    let store = execra::store::Store::open(&config.db_path).await.unwrap();
+    let store = execra::store::Store::open(&config.db_path).unwrap();
     let id = JobId::new();
     let job = Job {
         id,
@@ -398,11 +412,11 @@ async fn open_marks_stranded_running_jobs_failed() {
         exit: None,
         outcome: None,
     };
-    store.upsert_job(&job).await.unwrap();
+    store.upsert_job(&job).unwrap();
     drop(store);
 
-    let rt = Execra::open(config).await.unwrap();
-    let job = rt.job(id).await.expect("stranded job should load");
+    let rt = config.build();
+    let job = rt.job(id).expect("stranded job should load");
     assert_eq!(job.state, JobState::Finalized);
     assert!(matches!(
         job.outcome,
@@ -416,8 +430,8 @@ async fn open_marks_stranded_running_jobs_failed() {
 #[tokio::test]
 async fn raw_output_policy_controls_flat_log_files() {
     let persist_config = test_config();
-    let rt = Execra::open(persist_config.clone()).await.unwrap();
-    let handle = rt.spawn(echo("raw line")).await.unwrap();
+    let rt = persist_config.clone().build();
+    let handle = rt.spawn(echo("raw line")).unwrap();
     let id = handle.id();
     let outcome = handle.await;
     assert!(
@@ -430,9 +444,9 @@ async fn raw_output_policy_controls_flat_log_files() {
     #[cfg(feature = "gzip")]
     {
         let mut gzip_config = test_config();
-        gzip_config.raw_output = RawOutputPolicy::PersistGzipOnFinalize;
-        let rt = Execra::open(gzip_config.clone()).await.unwrap();
-        let handle = rt.spawn(echo("gzip line")).await.unwrap();
+        gzip_config.raw_output = Some(RawOutputPolicy::PersistGzipOnFinalize);
+        let rt = gzip_config.clone().build();
+        let handle = rt.spawn(echo("gzip line")).unwrap();
         let id = handle.id();
         let outcome = handle.await;
         assert!(
@@ -448,9 +462,9 @@ async fn raw_output_policy_controls_flat_log_files() {
     }
 
     let mut disabled_config = test_config();
-    disabled_config.raw_output = RawOutputPolicy::Disabled;
-    let rt = Execra::open(disabled_config.clone()).await.unwrap();
-    let handle = rt.spawn(echo("drop line")).await.unwrap();
+    disabled_config.raw_output = Some(RawOutputPolicy::Disabled);
+    let rt = disabled_config.clone().build();
+    let handle = rt.spawn(echo("drop line")).unwrap();
     let id = handle.id();
     let outcome = handle.await;
     assert!(
@@ -463,9 +477,9 @@ async fn raw_output_policy_controls_flat_log_files() {
 #[tokio::test]
 async fn memory_only_raw_output_streams_live_without_flat_log() {
     let mut config = test_config();
-    config.raw_output = RawOutputPolicy::MemoryOnly;
-    let rt = Execra::open(config.clone()).await.unwrap();
-    let mut handle = rt.spawn(echo("memory line")).await.unwrap();
+    config.raw_output = Some(RawOutputPolicy::MemoryOnly);
+    let rt = config.clone().build();
+    let mut handle = rt.spawn(echo("memory line")).unwrap();
     let id = handle.id();
     let mut events = handle.subscribe();
     let mut saw_output = false;
@@ -490,7 +504,7 @@ async fn memory_only_raw_output_streams_live_without_flat_log() {
 #[tokio::test]
 async fn higher_persisted_schema_version_is_rejected() {
     let config = test_config();
-    let store = execra::store::Store::open(&config.db_path).await.unwrap();
+    let store = execra::store::Store::open(&config.db_path).unwrap();
     let id = JobId::new();
     let job = Job {
         id,
@@ -507,7 +521,7 @@ async fn higher_persisted_schema_version_is_rejected() {
             findings: vec![],
         }),
     };
-    store.upsert_job(&job).await.unwrap();
+    store.upsert_job(&job).unwrap();
     drop(store);
 
     let conn = rusqlite::Connection::open(&config.db_path).unwrap();
@@ -515,8 +529,8 @@ async fn higher_persisted_schema_version_is_rejected() {
         .unwrap();
     drop(conn);
 
-    let store = execra::store::Store::open(&config.db_path).await.unwrap();
-    let err = store.load_job(id).await.unwrap_err();
+    let store = execra::store::Store::open(&config.db_path).unwrap();
+    let err = store.load_job(id).unwrap_err();
     assert!(matches!(
         err,
         execra::store::StoreError::UnsupportedSchemaVersion {
@@ -555,3 +569,5 @@ fn command_helpers_build_platform_shells() {
     assert_eq!(Command::cmd("echo ok").spec().args, vec!["/C", "echo ok"]);
     assert_eq!(Command::sh("echo ok").spec().args, vec!["-c", "echo ok"]);
 }
+
+

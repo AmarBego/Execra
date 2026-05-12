@@ -1,22 +1,10 @@
-//! # DO NOT DEPEND ON THIS CRATE
-//!
-//! Execra is currently in heavy testing inside the author's own `rScoop`
-//! project as the load-bearing case for whether it works as a
-//! general-purpose public crate. External consumers are **not** supported
-//! at this time: the API, the wire format, and the persistence schema
-//! will change without notice, and the crate may end up being narrowed
-//! back into an `rScoop`-only implementation detail rather than a
-//! published library. Read it, fork it, learn from it — do not `cargo
-//! add` it in production until a `1.0` release sets a stability
-//! contract.
-//!
-//! ---
+//! # Execra
 //!
 //! Execra is a typed job runtime for external processes. You hand it a
 //! [`Command`], it gives you back a [`JobHandle`] that you can either `.await`
 //! for the final [`Outcome`] or subscribe to as an event stream. Each job
-//! gets phases, progress, findings, persistence, and process-group
-//! cancellation, behind a single [`Execra::spawn`] entry point.
+//! gets phases, progress, findings, and process-group cancellation, behind
+//! a single [`Runtime::spawn`] entry point.
 //!
 //! Interpretation of a CLI's output into structured events is decoupled from
 //! the runtime via the [`Interpreter`] trait; see the `INTERPRETER.md` file
@@ -25,15 +13,27 @@
 //! # Quick example
 //!
 //! ```no_run
-//! use execra::{Command, Config, Execra, Outcome};
+//! use execra::{Command, Outcome, Runtime};
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let rt = Execra::open(Config::default()).await?;
+//! let rt = Runtime::new();
 //! let outcome = rt
-//!     .spawn(Command::new("echo").arg("hello").label("greet"))
-//!     .await?
+//!     .spawn(Command::new("echo").arg("hello").label("greet"))?
 //!     .await;
 //! assert!(matches!(outcome, Outcome::Succeeded { .. }));
+//! # Ok(()) }
+//! ```
+//!
+//! Pure in-memory by default: no SQLite, no log files. Opt in to persistence
+//! with the builder:
+//!
+//! ```no_run
+//! use execra::Runtime;
+//! # fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let rt = Runtime::builder()
+//!     .history("./jobs.sqlite")
+//!     .max_concurrent(4)
+//!     .build()?;
 //! # Ok(()) }
 //! ```
 //!
@@ -44,9 +44,11 @@
 //! * `gzip` *(default)* — Enable [`RawOutputPolicy::PersistGzipOnFinalize`]
 //!   and pull in `flate2`. Without this feature raw logs can still be
 //!   persisted uncompressed via [`RawOutputPolicy::Persist`].
+//! * `tauri` — Enable [`execra::tauri`](crate::tauri), the built-in Tauri
+//!   plugin and `AppHandle::execra()` extension trait.
 //!
-//! See `SCHEMA.md`, `RUNTIME.md`, and `INTERPRETER.md` in the repository for
-//! the full design contract.
+//! See `RUNTIME.md` and `INTERPRETER.md` in the repository for the design
+//! contract.
 
 pub mod command;
 pub mod event;
@@ -59,6 +61,8 @@ mod proc_group;
 pub mod progress;
 pub mod runtime;
 pub mod store;
+#[cfg(feature = "tauri")]
+pub mod tauri;
 
 pub use command::{Command, StdinMode};
 pub use event::{Event, Stream};
@@ -68,4 +72,6 @@ pub use job::{Job, JobId, JobState};
 pub use outcome::{ExitCode, FailureReason, Outcome};
 pub use phase::{Phase, PhaseId};
 pub use progress::{Progress, ProgressMetric};
-pub use runtime::{Config, Execra, JobHandle, JobsQuery, RawOutputPolicy, RetentionPolicy};
+pub use runtime::{
+    JobHandle, JobsQuery, RawOutputPolicy, RetentionPolicy, Runtime, RuntimeBuilder,
+};

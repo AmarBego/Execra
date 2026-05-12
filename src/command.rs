@@ -48,7 +48,7 @@ pub struct CommandSpec {
     pub hide_window: bool,
 }
 
-/// Builder + interpreter slot. Pass to `Execra::spawn`.
+/// Builder + interpreter slot. Pass to `Runtime::spawn`.
 ///
 /// Not `Clone` because the interpreter is a heap-stored trait object; if
 /// you need a cloneable view of the command, use [`Command::spec`].

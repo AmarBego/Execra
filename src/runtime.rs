@@ -4,6 +4,7 @@
 //! focused submodules so process driving, handles, queries, and streams can
 //! evolve independently.
 
+mod builder;
 mod config;
 mod driver;
 mod handle;
@@ -24,9 +25,11 @@ use crate::command::Command;
 use crate::event::Event;
 use crate::job::{Job, JobId, JobState};
 use crate::progress::Progress;
-use crate::store::{JobsFilter, Store, StoreError};
+use crate::store::{Store, StoreError};
 
-pub use config::{Config, RawOutputPolicy, RetentionPolicy};
+pub use builder::RuntimeBuilder;
+pub use config::{RawOutputPolicy, RetentionPolicy};
+pub(crate) use config::RuntimeConfig;
 pub use handle::JobHandle;
 pub use query::JobsQuery;
 pub use stream::EventStream;
@@ -50,30 +53,45 @@ const MEMORY_RAW_CAPACITY: usize = 1024;
 pub(super) type MemoryRawOutput = Arc<Mutex<HashMap<JobId, VecDeque<String>>>>;
 
 pub(super) struct Inner {
-    pub(super) config: Config,
-    pub(super) store: Store,
+    pub(super) config: RuntimeConfig,
+    pub(super) store: Option<Store>,
     pub(super) events_tx: tokio::sync::broadcast::Sender<Event>,
     pub(super) permits: Arc<Semaphore>,
     pub(super) memory_raw: MemoryRawOutput,
     pub(super) jobs: Mutex<HashMap<JobId, JobEntry>>,
 }
 
+/// Typed job runtime. Owns process lifecycle, output decoding, process-group
+/// cancellation, and (optionally) persistence.
+///
+/// Construct with [`Runtime::new`] for a pure in-memory runtime, or
+/// [`Runtime::builder`] when you need persistence or non-default knobs.
 #[derive(Clone)]
-pub struct Execra {
+pub struct Runtime {
     pub(super) inner: Arc<Inner>,
 }
 
-impl Execra {
-    pub async fn open(config: Config) -> Result<Self, Error> {
-        let store = Store::open(&config.db_path).await?;
-        store.resurrect_stranded_jobs().await?;
-        let persisted_jobs = store.list_jobs(10_000, &JobsFilter::default()).await?;
+impl Runtime {
+    /// In-memory runtime with sensible defaults. No SQLite, no log files,
+    /// no retention. Infallible and synchronous — safe to call from any
+    /// context (including `main()` before a tokio runtime exists).
+    pub fn new() -> Self {
+        Self::from_parts(RuntimeConfig::default(), None, Vec::new())
+    }
 
+    /// Returns a builder for opt-in persistence and tuning.
+    pub fn builder() -> RuntimeBuilder {
+        RuntimeBuilder::default()
+    }
+
+    pub(crate) fn from_parts(
+        config: RuntimeConfig,
+        store: Option<Store>,
+        persisted: Vec<Job>,
+    ) -> Self {
         let (events_tx, _initial_rx) = tokio::sync::broadcast::channel(1024);
-        driver::spawn_store_writer(store.clone(), events_tx.subscribe());
-
         let mut jobs = HashMap::new();
-        for job in persisted_jobs {
+        for job in persisted {
             jobs.insert(
                 job.id,
                 JobEntry {
@@ -82,8 +100,7 @@ impl Execra {
                 },
             );
         }
-
-        Ok(Execra {
+        Runtime {
             inner: Arc::new(Inner {
                 permits: Arc::new(Semaphore::new(config.max_concurrent.max(1))),
                 memory_raw: Arc::new(Mutex::new(HashMap::new())),
@@ -92,10 +109,13 @@ impl Execra {
                 events_tx,
                 jobs: Mutex::new(jobs),
             }),
-        })
+        }
     }
 
-    pub async fn spawn(&self, cmd: Command) -> Result<JobHandle, Error> {
+    /// Spawn a new job. Synchronous: the call returns as soon as the driver
+    /// task is scheduled. Must be invoked from inside a tokio runtime context
+    /// (the driver itself runs via `tokio::spawn`).
+    pub fn spawn(&self, cmd: Command) -> Result<JobHandle, Error> {
         let (spec, stdin, interpreter) = cmd.into_parts();
         let job_id = JobId::new();
         let cancel = CancellationToken::new();
@@ -114,8 +134,10 @@ impl Execra {
             outcome: None,
         };
         let snapshot = Arc::new(Mutex::new(job));
-        let initial_job = snapshot.lock().unwrap().clone();
-        self.inner.store.upsert_job(&initial_job).await?;
+        if let Some(store) = &self.inner.store {
+            let initial_job = snapshot.lock().unwrap().clone();
+            store.upsert_job(&initial_job)?;
+        }
 
         self.inner.jobs.lock().unwrap().insert(
             job_id,
@@ -131,6 +153,13 @@ impl Execra {
             command: spec.clone(),
             at: now,
         });
+        if let Some(store) = &self.inner.store {
+            let _ = store.insert_event(&Event::JobCreated {
+                job: job_id,
+                command: spec.clone(),
+                at: now,
+            });
+        }
 
         let (outcome_tx, outcome_rx) = oneshot::channel();
         tokio::spawn(driver::drive_job(
@@ -166,7 +195,32 @@ impl Execra {
         Ok(())
     }
 
-    pub async fn job(&self, id: JobId) -> Option<Job> {
+    /// Most recent first, in-memory snapshots only. Includes finished jobs
+    /// still resident in the cache. For full history, use [`Runtime::jobs`]
+    /// with persistence enabled.
+    pub fn recent(&self, n: usize) -> Vec<Job> {
+        let jobs = self.inner.jobs.lock().unwrap();
+        let mut out: Vec<Job> = jobs
+            .values()
+            .map(|e| e.snapshot.lock().unwrap().clone())
+            .collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        out.truncate(n);
+        out
+    }
+
+    /// Job IDs that are currently `Queued` or `Running`.
+    pub fn running(&self) -> Vec<JobId> {
+        let jobs = self.inner.jobs.lock().unwrap();
+        jobs.iter()
+            .filter_map(|(id, e)| {
+                let st = e.snapshot.lock().unwrap().state;
+                matches!(st, JobState::Queued | JobState::Running).then_some(*id)
+            })
+            .collect()
+    }
+
+    pub fn job(&self, id: JobId) -> Option<Job> {
         let in_memory = {
             let jobs = self.inner.jobs.lock().unwrap();
             jobs.get(&id).map(|e| e.snapshot.lock().unwrap().clone())
@@ -174,7 +228,10 @@ impl Execra {
         if in_memory.is_some() {
             return in_memory;
         }
-        self.inner.store.load_job(id).await.ok().flatten()
+        self.inner
+            .store
+            .as_ref()
+            .and_then(|s| s.load_job(id).ok().flatten())
     }
 
     pub fn jobs(&self) -> JobsQuery {
@@ -187,5 +244,11 @@ impl Execra {
 
     pub fn subscribe_job(&self, id: JobId) -> EventStream {
         EventStream::new(self.inner.events_tx.subscribe(), Some(id))
+    }
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::new()
     }
 }

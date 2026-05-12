@@ -16,6 +16,15 @@ pub enum Stream {
     Stderr,
 }
 
+impl Stream {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Stream::Stdout => "stdout",
+            Stream::Stderr => "stderr",
+        }
+    }
+}
+
 /// The wire protocol. Every consumer reads this.
 ///
 /// Append-only. Totally ordered per job by `at`.

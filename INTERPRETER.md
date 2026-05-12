@@ -1,6 +1,6 @@
 # Interpreter Contract
 
-An interpreter turns a process's output stream into the typed events defined in [SCHEMA.md](SCHEMA.md). The runtime hosts interpreters; it does not embed their logic.
+An interpreter turns a process's output stream into Execra's typed events. The runtime hosts interpreters; it does not embed their logic.
 
 This document defines the contract every interpreter must obey.
 
@@ -101,7 +101,7 @@ Progress::indeterminate("verifying")
 Progress::fraction(0.42)
 ```
 
-These are conveniences over the schema types in SCHEMA.md, not new concepts.
+These are conveniences over the public event types, not new concepts.
 
 ---
 
@@ -138,7 +138,7 @@ If an interpreter wants to surface a parsing problem without giving up entirely,
 
 ## Future: WASM interpreters
 
-The trait is designed so a `wasmtime`-hosted interpreter can be added later without changing the schema or the runtime API. The boundary would be JSON in / JSON out per call:
+The trait is designed so a `wasmtime`-hosted interpreter can be added later without changing the runtime API. The boundary would be JSON in / JSON out per call:
 
 ```
 input:  { line, stream, current_phase, elapsed }
@@ -153,4 +153,4 @@ A declarative rule-file format (TOML/YAML) was prototyped and dropped. Native Ru
 
 ## Versioning
 
-The `Interpreter` trait is part of the public API and versions with the schema. Additive changes to `InterpreterEvent` (new variants, new optional fields) are minor; renames or removals are breaking.
+The `Interpreter` trait is part of the public API. Additive changes to `InterpreterEvent` (new variants, new optional fields) are minor; renames or removals are breaking.

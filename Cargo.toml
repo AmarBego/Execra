@@ -1,8 +1,8 @@
 [package]
 name = "execra"
-description = "DO NOT DEPEND ON THIS CRATE — in heavy testing inside rScoop. Typed job runtime for external processes: phases, progress, findings, persistence, and per-job cancellation."
+description = "Typed job runtime for Rust apps that wrap external CLI tools: events, interpreters, cancellation, Tauri integration, and optional persistence."
 authors = ["AmarBego"]
-version = "0.1.2"
+version = "1.0.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/AmarBego/Execra"
@@ -18,7 +18,6 @@ rustdoc-args = ["--cfg", "docsrs"]
 members = [
     ".",
     "crates/execra-cli",
-    "crates/execra-tauri",
 ]
 resolver = "2"
 
@@ -35,6 +34,10 @@ bundled-sqlite = ["rusqlite/bundled"]
 # tree; raw logs can still be persisted uncompressed.
 gzip = ["dep:flate2"]
 
+# Enable `execra::tauri`, a first-class plugin for Tauri apps. Pulls in
+# `tauri` as a dependency. Off by default so non-Tauri consumers stay lean.
+tauri = ["dep:tauri"]
+
 [dependencies]
 uuid = { version = "1.23.1", features = ["v7", "serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -46,6 +49,7 @@ tokio = { version = "1", features = ["fs", "process", "rt", "rt-multi-thread", "
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 futures-core = "0.3"
+tauri = { version = "2", optional = true, default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
@@ -66,3 +70,7 @@ crate-type = ["lib"]
 name = "scoop_doctor"
 path = "examples/scoop_doctor.rs"
 crate-type = ["lib"]
+
+[[example]]
+name = "move1_acceptance"
+path = "examples/move1_acceptance.rs"
