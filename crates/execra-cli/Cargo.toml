@@ -1,10 +1,10 @@
 [package]
 name = "execra-cli"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 description = "Command-line interface for Execra."
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/amar/Execra"
+license = "Apache-2.0"
+repository = "https://github.com/AmarBego/Execra"
 
 [[bin]]
 name = "execra"
@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-execra = { version = "0.0.1", path = "../.." }
+execra = { version = "0.1.0", path = "../.." }
 flate2 = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
