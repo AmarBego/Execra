@@ -29,6 +29,7 @@ impl Default for Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawOutputPolicy {
     Persist,
+    #[cfg(feature = "gzip")]
     PersistGzipOnFinalize,
     MemoryOnly,
     Disabled,

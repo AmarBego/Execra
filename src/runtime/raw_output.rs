@@ -5,9 +5,14 @@ use crate::job::JobId;
 use super::{Config, RawOutputPolicy};
 
 pub(super) async fn open_raw_log(job_id: JobId, config: &Config) -> Option<tokio::fs::File> {
-    match config.raw_output {
-        RawOutputPolicy::Persist | RawOutputPolicy::PersistGzipOnFinalize => {}
-        RawOutputPolicy::MemoryOnly | RawOutputPolicy::Disabled => return None,
+    let persist = match config.raw_output {
+        RawOutputPolicy::Persist => true,
+        #[cfg(feature = "gzip")]
+        RawOutputPolicy::PersistGzipOnFinalize => true,
+        RawOutputPolicy::MemoryOnly | RawOutputPolicy::Disabled => false,
+    };
+    if !persist {
+        return None;
     }
 
     if tokio::fs::create_dir_all(&config.log_dir).await.is_err() {
@@ -31,20 +36,29 @@ pub(super) async fn finalize_raw_log(
     }
     drop(raw_file.take());
 
-    if !matches!(config.raw_output, RawOutputPolicy::PersistGzipOnFinalize) {
-        return;
+    #[cfg(feature = "gzip")]
+    {
+        if !matches!(config.raw_output, RawOutputPolicy::PersistGzipOnFinalize) {
+            return;
+        }
+
+        let src = config.log_dir.join(format!("{job_id}.log"));
+        let dst = config.log_dir.join(format!("{job_id}.log.gz"));
+        let _ = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let mut input = std::fs::File::open(&src)?;
+            let output = std::fs::File::create(&dst)?;
+            let mut encoder =
+                flate2::write::GzEncoder::new(output, flate2::Compression::default());
+            std::io::copy(&mut input, &mut encoder)?;
+            encoder.finish()?;
+            std::fs::remove_file(src)?;
+            Ok(())
+        })
+        .await;
     }
 
-    let src = config.log_dir.join(format!("{job_id}.log"));
-    let dst = config.log_dir.join(format!("{job_id}.log.gz"));
-    let _ = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        let mut input = std::fs::File::open(&src)?;
-        let output = std::fs::File::create(&dst)?;
-        let mut encoder = flate2::write::GzEncoder::new(output, flate2::Compression::default());
-        std::io::copy(&mut input, &mut encoder)?;
-        encoder.finish()?;
-        std::fs::remove_file(src)?;
-        Ok(())
-    })
-    .await;
+    #[cfg(not(feature = "gzip"))]
+    {
+        let _ = (job_id, config);
+    }
 }

@@ -1,6 +1,7 @@
 //! End-to-end smoke tests for the runtime. Uses platform shell so it can
 //! run on both Windows and Unix without bundling test fixtures.
 
+#[cfg(feature = "gzip")]
 use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
@@ -426,22 +427,25 @@ async fn raw_output_policy_controls_flat_log_files() {
     let log = std::fs::read_to_string(persist_config.log_dir.join(format!("{id}.log"))).unwrap();
     assert!(log.contains("[stdout] raw line"));
 
-    let mut gzip_config = test_config();
-    gzip_config.raw_output = RawOutputPolicy::PersistGzipOnFinalize;
-    let rt = Execra::open(gzip_config.clone()).await.unwrap();
-    let handle = rt.spawn(echo("gzip line")).await.unwrap();
-    let id = handle.id();
-    let outcome = handle.await;
-    assert!(
-        matches!(outcome, Outcome::Succeeded { .. }),
-        "got {outcome:?}"
-    );
-    assert!(!gzip_config.log_dir.join(format!("{id}.log")).exists());
-    let gz = std::fs::File::open(gzip_config.log_dir.join(format!("{id}.log.gz"))).unwrap();
-    let mut decoder = flate2::read::GzDecoder::new(gz);
-    let mut log = String::new();
-    decoder.read_to_string(&mut log).unwrap();
-    assert!(log.contains("[stdout] gzip line"));
+    #[cfg(feature = "gzip")]
+    {
+        let mut gzip_config = test_config();
+        gzip_config.raw_output = RawOutputPolicy::PersistGzipOnFinalize;
+        let rt = Execra::open(gzip_config.clone()).await.unwrap();
+        let handle = rt.spawn(echo("gzip line")).await.unwrap();
+        let id = handle.id();
+        let outcome = handle.await;
+        assert!(
+            matches!(outcome, Outcome::Succeeded { .. }),
+            "got {outcome:?}"
+        );
+        assert!(!gzip_config.log_dir.join(format!("{id}.log")).exists());
+        let gz = std::fs::File::open(gzip_config.log_dir.join(format!("{id}.log.gz"))).unwrap();
+        let mut decoder = flate2::read::GzDecoder::new(gz);
+        let mut log = String::new();
+        decoder.read_to_string(&mut log).unwrap();
+        assert!(log.contains("[stdout] gzip line"));
+    }
 
     let mut disabled_config = test_config();
     disabled_config.raw_output = RawOutputPolicy::Disabled;
