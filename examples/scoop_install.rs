@@ -147,7 +147,7 @@ impl Interpreter for ScoopInstall {
             }];
         }
 
-        // Summary lines. Never decide success — only enrich it.
+        // Summary lines. Never decide success , only enrich it.
         if let Some(c) = RE_INSTALLED_OK.captures(l) {
             return vec![Event::Summary {
                 text: format!("Installed {} {}", &c[1], &c[2]),

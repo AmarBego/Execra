@@ -33,7 +33,7 @@ impl std::fmt::Debug for StdinMode {
 ///
 /// Fields that the OS expresses as `OsString` are stored here as plain
 /// `String`. On Windows, paths that aren't valid UTF-16 (extremely rare in
-/// practice) are converted lossily at the spawn boundary — the wire format
+/// practice) are converted lossily at the spawn boundary , the wire format
 /// stays clean and the DB stays human-readable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandSpec {

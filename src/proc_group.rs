@@ -1,4 +1,4 @@
-//! Process-group cancellation. The runtime must kill descendants too — when
+//! Process-group cancellation. The runtime must kill descendants too , when
 //! `scoop install` is cancelled, the `aria2` it spawned has to die with it.
 //!
 //! - Windows: assign the child to a Win32 Job Object with

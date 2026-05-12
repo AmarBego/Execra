@@ -1,4 +1,4 @@
-//! Execra — typed job runtime for external processes.
+//! Execra , typed job runtime for external processes.
 //!
 //! See `SCHEMA.md`, `RUNTIME.md`, and `INTERPRETER.md` for the contract.
 //! This crate is the implementation; those documents are the product.

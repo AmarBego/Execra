@@ -94,13 +94,13 @@ pub struct Phase {
 - Phases are scoped to a single job. PhaseIds are not global.
 - An interpreter cannot pop a phase it did not push. Mismatched pops are dropped and logged as `InterpreterError`.
 - If a job exits with phases still on the stack, the runtime pops them in order before finalizing.
-- Nested phases are supported. Concurrent phases are not (yet) — model them with labels or wait for a real case.
+- Nested phases are supported. Concurrent phases are not (yet) , model them with labels or wait for a real case.
 
 ---
 
 ## Events
 
-The event stream is the wire protocol. Every consumer — Tauri, CLI tail, future bindings — reads this.
+The event stream is the wire protocol. Every consumer , Tauri, CLI tail, future bindings , reads this.
 
 ```rust
 pub enum Event {
@@ -187,9 +187,9 @@ pub enum RelatedEntity {
 
 ### Action kinds
 
-- `Command` — UIs render as a button. Clicking it runs the program with args (typically as a new Execra job).
-- `Link` — UIs render as an anchor. Clicking opens the URL in the system browser.
-- `Instruction` — UIs render as copyable text. Used when the remediation is human-only ("Enable Developer Mode in Settings").
+- `Command` , UIs render as a button. Clicking it runs the program with args (typically as a new Execra job).
+- `Link` , UIs render as an anchor. Clicking opens the URL in the system browser.
+- `Instruction` , UIs render as copyable text. Used when the remediation is human-only ("Enable Developer Mode in Settings").
 
 Untyped string actions are deliberately not supported. If an interpreter doesn't know enough to classify the action, it emits the finding with `action: None` rather than a string the UI can't act on.
 
@@ -199,7 +199,7 @@ Untyped string actions are deliberately not supported. If an interpreter doesn't
 |---|---|---|
 | Lifecycle | Streamed, transient | Streamed *and* persisted into `Outcome` |
 | Purpose | "Something noteworthy happened" | "Here is a result to act on" |
-| Example | "Download retried after timeout" | "7-Zip is missing — install it" |
+| Example | "Download retried after timeout" | "7-Zip is missing , install it" |
 | Survives finalization | No | Yes, in `Outcome.findings` |
 
 If you're not sure which one to emit: would a UI want to show it in a "results" list after the job ends? If yes, it's a finding. If it's only interesting while the job is running, it's a warning.
@@ -229,11 +229,11 @@ pub enum FailureReason {
 }
 ```
 
-### Rules — these are non-negotiable
+### Rules , these are non-negotiable
 
 1. **Exit code owns terminal state.** A process that exits non-zero is `Failed`, regardless of what its output said.
 2. **Interpreters enrich, they do not override.** A rule that matches "Successfully installed" cannot turn a non-zero exit into `Succeeded`. It can only provide a `summary`.
-3. **A non-zero exit with a matched `KnownErrorDetected` becomes `Failed { reason: KnownError, .. }`** — the interpretation enriches the failure reason but does not change the verdict.
+3. **A non-zero exit with a matched `KnownErrorDetected` becomes `Failed { reason: KnownError, .. }`** , the interpretation enriches the failure reason but does not change the verdict.
 4. **`Cancelled` is its own thing.** A job killed by the user is not `Failed`. The outcome and the UI treatment differ.
 
 ### Sequence at termination

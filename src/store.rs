@@ -1,6 +1,6 @@
 //! SQLite persistence. Stores jobs (one row), events (JSON blob per row), and
 //! findings (denormalized for queryability). Raw `OutputAppended` events are
-//! intentionally *not* persisted to SQLite — they belong in flat files
+//! intentionally *not* persisted to SQLite , they belong in flat files
 //! (next pass). High-volume CLIs would balloon the database otherwise.
 
 use std::path::Path;

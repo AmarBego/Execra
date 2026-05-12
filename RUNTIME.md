@@ -162,7 +162,7 @@ Semantics:
 
 ## Termination order
 
-Pipe EOF and process exit are independent OS events. A naive runtime that triggers `on_exit` on `child.wait()` alone can lose the final lines still buffered in the pipe at exit time — including the summary or known-error line that decides how the job is classified.
+Pipe EOF and process exit are independent OS events. A naive runtime that triggers `on_exit` on `child.wait()` alone can lose the final lines still buffered in the pipe at exit time , including the summary or known-error line that decides how the job is classified.
 
 Execra guarantees this order:
 
@@ -193,15 +193,15 @@ Concretely, this means:
 
 Two stores, one runtime. The split keeps the SQLite database small and queryable while letting raw output stay cheap.
 
-**SQLite — events, jobs, metadata.**
+**SQLite , events, jobs, metadata.**
 - Job records (command, label, tags, timestamps, state, outcome).
 - Interpreted events: `PhaseEntered`, `ProgressUpdated`, `Finding`, `Warning`, `KnownError`, `Summary`, `Exited`, `Finalized`, etc.
 - Queryable via `rt.jobs()` (filter by state, tag, time range).
 
-**Flat files — raw output.**
+**Flat files , raw output.**
 - One file per job: `<log_dir>/<job_id>.log` (or `.log.gz` after finalization, configurable).
 - Append-only during the job; closed and optionally gzipped on `Finalized`.
-- `OutputAppended` events surfacing to subscribers are sourced from the flat file. The wire shape is identical regardless of storage — consumers don't know the difference.
+- `OutputAppended` events surfacing to subscribers are sourced from the flat file. The wire shape is identical regardless of storage , consumers don't know the difference.
 
 This split exists because a `cargo build` or `npm install` can emit 10K+ output lines. Inserting that many rows into SQLite per job destroys write throughput and balloons the database. Flat files are cheap to append, cheap to gzip, cheap to delete, and trivial to tail.
 
@@ -233,7 +233,7 @@ pub struct RetentionPolicy {
 
 `Command::timeout(d)` enforces a wall-clock deadline from successful process spawn. On timeout the runtime kills the process group, emits the raw `Exited` event when the OS reports termination, and finalizes as `Outcome::Failed { reason: FailureReason::Timeout, .. }`. User cancellation remains distinct and finalizes as `Outcome::Cancelled`.
 
-`Disabled` is useful for noisy CLIs whose output isn't worth keeping (compile spam, large `tar` operations) and for sensitive jobs whose raw output shouldn't hit disk. Even with `Disabled`, the event stream is unaffected — interpreted events still persist; subscribers still see `OutputAppended` live; nothing is written to the flat file.
+`Disabled` is useful for noisy CLIs whose output isn't worth keeping (compile spam, large `tar` operations) and for sensitive jobs whose raw output shouldn't hit disk. Even with `Disabled`, the event stream is unaffected , interpreted events still persist; subscribers still see `OutputAppended` live; nothing is written to the flat file.
 
 ### Resumability
 

@@ -107,7 +107,7 @@ These are conveniences over the schema types in SCHEMA.md, not new concepts.
 
 ## Multi-line patterns
 
-Cross-line state — Notes blocks, multi-line stack traces, indented continuations — lives in `self`. No special runtime support needed; the common pattern is a buffer plus a boolean:
+Cross-line state , Notes blocks, multi-line stack traces, indented continuations , lives in `self`. No special runtime support needed; the common pattern is a buffer plus a boolean:
 
 ```rust
 if self.in_notes {
