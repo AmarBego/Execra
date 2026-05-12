@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "execra"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "flate2",
  "futures-core",
@@ -200,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "execra-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "execra-tauri"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "execra",
  "serde",

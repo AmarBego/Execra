@@ -1,5 +1,7 @@
 # Execra
 
+!!! WIP (for rScoop for now) !!!
+
 **Never write the process plumbing again.**
 
 Execra is a job runtime for external processes. You spawn a command, it gives you back a typed event stream , phases, progress, findings, terminal outcome , plus persistence, per-job cancellation, and a uniform shape every UI can render.
