@@ -1,0 +1,20 @@
+[package]
+name = "execra-cli"
+version = "0.0.1"
+edition = "2021"
+description = "Command-line interface for Execra."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/amar/Execra"
+
+[[bin]]
+name = "execra"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+execra = { version = "0.0.1", path = "../.." }
+flate2 = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+uuid = "1"

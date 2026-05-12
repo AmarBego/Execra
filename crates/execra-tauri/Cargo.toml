@@ -1,0 +1,11 @@
+[package]
+name = "execra-tauri"
+version = "0.0.1"
+edition = "2021"
+description = "Thin adapter types for forwarding Execra events to Tauri."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/amar/Execra"
+
+[dependencies]
+execra = { version = "0.0.1", path = "../.." }
+serde = { version = "1", features = ["derive"] }
