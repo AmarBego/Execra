@@ -2,7 +2,7 @@
 name = "execra"
 description = "Typed job runtime for Rust apps that wrap external CLI tools: events, interpreters, cancellation, Tauri integration, and optional persistence."
 authors = ["AmarBego"]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/AmarBego/Execra"
@@ -38,12 +38,18 @@ gzip = ["dep:flate2"]
 # `tauri` as a dependency. Off by default so non-Tauri consumers stay lean.
 tauri = ["dep:tauri"]
 
+# Enable `execra::interpret`, the table-driven interpreter toolkit
+# (`rules!` macro, `RuleInterpreter`). Pulls in `regex`. Off by default so
+# consumers that hand-write interpreters don't pay for it.
+interpret = ["dep:regex"]
+
 [dependencies]
 uuid = { version = "1.23.1", features = ["v7", "serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0.18"
 flate2 = { version = "1", optional = true }
+regex = { version = "1.12.3", optional = true }
 rusqlite = { version = "0.39.0", default-features = false }
 tokio = { version = "1", features = ["fs", "process", "rt", "rt-multi-thread", "io-util", "macros", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

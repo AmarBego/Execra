@@ -34,6 +34,7 @@
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 use tauri::plugin::{Builder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Manager, Runtime as TauriRuntime};
@@ -44,9 +45,52 @@ use crate::event::{Event, Stream};
 use crate::interpreter::Interpreter;
 use crate::job::{Job, JobId};
 use crate::outcome::{FailureReason, Outcome};
+use crate::progress::Progress;
 use crate::runtime::{Error, EventStream, JobHandle, Runtime};
 
 type EventObserver<R> = Box<dyn Fn(&AppHandle<R>, &Event) + Send + 'static>;
+type CreepFn = Box<dyn Fn(&str) -> Option<(f32, f32)> + Send + Sync + 'static>;
+
+/// Synthetic-progress ticker for a phase that has no determinate signal of
+/// its own. Without it the bar sits frozen while a long opaque step (hashing
+/// a multi-GB file, an installer script) runs. It eases the fraction toward
+/// the phase's end but stops short of it, so a real boundary/byte signal
+/// always has somewhere to take over.
+struct CreepState {
+    cap: f32,
+    cur: f32,
+    done: bool,
+}
+
+impl CreepState {
+    fn new(start: f32, end: f32) -> Self {
+        Self {
+            // Stop just shy of the end so the next phase boundary still has
+            // distance to advance over.
+            cap: start + 0.95 * (end - start),
+            cur: start,
+            done: false,
+        }
+    }
+
+    /// Advance ~2% of the remaining distance. Returns `Some(fraction)` only
+    /// when the rounded whole-percent changed (sub-percent bumps don't move
+    /// pixels and aren't worth an event).
+    fn tick(&mut self) -> Option<f32> {
+        if self.done {
+            return None;
+        }
+        let cur = self.cur;
+        if cur + 0.0001 >= self.cap {
+            self.done = true;
+            return None;
+        }
+        let new = (cur + (self.cap - cur) * 0.02).min(self.cap);
+        let changed = (new * 100.0).round() as i32 != (cur * 100.0).round() as i32;
+        self.cur = new;
+        changed.then_some(new)
+    }
+}
 
 /// Plugin with a default in-memory [`Runtime`].
 pub fn init<R: TauriRuntime>() -> TauriPlugin<R> {
@@ -116,6 +160,7 @@ impl<R: TauriRuntime> RuntimeRef<R> {
             channel: None,
             observers: Vec::new(),
             tags: Vec::new(),
+            creep: None,
         }
     }
 
@@ -158,6 +203,7 @@ pub struct TaskBuilder<R: TauriRuntime> {
     channel: Option<String>,
     observers: Vec<EventObserver<R>>,
     tags: Vec<String>,
+    creep: Option<CreepFn>,
 }
 
 impl<R: TauriRuntime> TaskBuilder<R> {
@@ -256,6 +302,29 @@ impl<R: TauriRuntime> TaskBuilder<R> {
         self
     }
 
+    /// Synthetic progress for opaque phases. `f` maps a phase name to the
+    /// fraction slice `(start, end)` it occupies; return `None` for phases
+    /// that already emit a real signal (e.g. byte progress) so the ticker
+    /// stays out of their way.
+    ///
+    /// While a phase with a range is open, a background ticker eases the
+    /// progress fraction toward `end` (stopping short of it) and emits
+    /// synthetic [`Event::ProgressUpdated`] to observers and the channel, so
+    /// the bar shows motion instead of freezing. The ticker is cancelled when
+    /// the phase exits or the job finalizes. Requires `.channel(...)` or an
+    /// observer to have somewhere to deliver the events.
+    ///
+    /// Pairs naturally with [`interpret::PhaseModel`](crate::interpret::PhaseModel):
+    /// pass a closure that consults the same phase weights.
+    pub fn creep<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&str) -> Option<(f32, f32)> + Send + Sync + 'static,
+    {
+        self.creep = Some(Box::new(f));
+        self
+    }
+
+    #[allow(clippy::type_complexity)]
     fn finalize_cmd(
         self,
     ) -> (
@@ -264,24 +333,34 @@ impl<R: TauriRuntime> TaskBuilder<R> {
         Command,
         Option<String>,
         Vec<EventObserver<R>>,
+        Option<CreepFn>,
     ) {
         let cmd = if self.tags.is_empty() {
             self.cmd
         } else {
             self.cmd.tags(self.tags)
         };
-        (self.app, self.rt, cmd, self.channel, self.observers)
+        (
+            self.app,
+            self.rt,
+            cmd,
+            self.channel,
+            self.observers,
+            self.creep,
+        )
     }
 
     fn spawn_with_forwarding(self) -> Result<(JobHandle, Option<JoinHandle<()>>), Error> {
-        let (app, rt, cmd, channel, observers) = self.finalize_cmd();
+        let (app, rt, cmd, channel, observers, creep) = self.finalize_cmd();
         let mut handle = rt.spawn(cmd)?;
-        let forwarder = if channel.is_some() || !observers.is_empty() {
+        let forwarder = if channel.is_some() || !observers.is_empty() || creep.is_some() {
             Some(forward_events(
                 app,
+                handle.id(),
                 handle.subscribe(),
                 channel,
                 observers,
+                creep,
             ))
         } else {
             None
@@ -336,21 +415,86 @@ impl<R: TauriRuntime> IntoFuture for TaskBuilder<R> {
 
 fn forward_events<R: TauriRuntime>(
     app: AppHandle<R>,
+    job_id: JobId,
     mut stream: EventStream,
     channel: Option<String>,
     observers: Vec<EventObserver<R>>,
+    creep: Option<CreepFn>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(event) = stream.next().await {
-            let stop = matches!(event, Event::Finalized { .. });
-            for observer in &observers {
-                observer(&app, &event);
+        // A free fn, not a closure: a closure capturing `&observers` would
+        // have to be held across the `.await` below, and `EventObserver` is
+        // `Send` but not `Sync`, so that borrow would make the future non-Send.
+        fn deliver<R: TauriRuntime>(
+            app: &AppHandle<R>,
+            observers: &[EventObserver<R>],
+            channel: &Option<String>,
+            event: &Event,
+        ) {
+            for observer in observers {
+                observer(app, event);
             }
-            if let Some(channel) = &channel {
-                let _ = app.emit(channel, &event);
+            if let Some(channel) = channel {
+                let _ = app.emit(channel, event);
             }
-            if stop {
-                break;
+        }
+
+        // No creep configured: stay on the cheap straight-through path.
+        let Some(creep) = creep else {
+            while let Some(event) = stream.next().await {
+                let stop = matches!(event, Event::Finalized { .. });
+                deliver(&app, &observers, &channel, &event);
+                if stop {
+                    break;
+                }
+            }
+            return;
+        };
+
+        let mut state: Option<CreepState> = None;
+        let mut ticker = tokio::time::interval(Duration::from_millis(500));
+        // First `tick()` resolves immediately; consume it so the first real
+        // bump lands ~500 ms after a creep phase opens.
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                biased;
+                next = stream.next() => {
+                    let Some(event) = next else { break };
+                    let stop = matches!(event, Event::Finalized { .. });
+                    match &event {
+                        // A creep phase opens — arm the ticker for its slice.
+                        // A phase with no range (real signal) disarms it.
+                        Event::PhaseEntered { name, .. } => {
+                            state = creep(name)
+                                .filter(|(s, e)| e > s)
+                                .map(|(s, e)| CreepState::new(s, e));
+                        }
+                        Event::PhaseExited { .. }
+                        | Event::Finalized { .. }
+                        | Event::Cancelled { .. } => state = None,
+                        _ => {}
+                    }
+                    deliver(&app, &observers, &channel, &event);
+                    if stop {
+                        break;
+                    }
+                }
+                _ = ticker.tick(), if state.is_some() => {
+                    let cs = state.as_mut().expect("guarded by state.is_some()");
+                    match cs.tick() {
+                        Some(frac) => deliver(&app, &observers, &channel, &Event::ProgressUpdated {
+                            job: job_id,
+                            progress: Progress::fraction(frac),
+                            at: SystemTime::now(),
+                        }),
+                        // Reached the cap — disarm so the timer arm goes
+                        // idle until the next creep phase.
+                        None if cs.done => state = None,
+                        None => {}
+                    }
+                }
             }
         }
     })

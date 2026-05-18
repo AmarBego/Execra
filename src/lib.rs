@@ -46,6 +46,9 @@
 //!   persisted uncompressed via [`RawOutputPolicy::Persist`].
 //! * `tauri` — Enable [`execra::tauri`](crate::tauri), the built-in Tauri
 //!   plugin and `AppHandle::execra()` extension trait.
+//! * `interpret` — Enable [`execra::interpret`](crate::interpret), a
+//!   table-driven [`Interpreter`] toolkit (the [`rules!`] macro,
+//!   `RuleInterpreter`, phase/notes/fallback helpers). Pulls in `regex`.
 //!
 //! See `RUNTIME.md` and `INTERPRETER.md` in the repository for the design
 //! contract.
@@ -53,6 +56,8 @@
 pub mod command;
 pub mod event;
 pub mod finding;
+#[cfg(feature = "interpret")]
+pub mod interpret;
 pub mod interpreter;
 pub mod job;
 pub mod outcome;

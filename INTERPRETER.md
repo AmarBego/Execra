@@ -149,6 +149,8 @@ This unlocks distributing interpreters as data and writing them in any language 
 
 A declarative rule-file format (TOML/YAML) was prototyped and dropped. Native Rust adapters turned out to be shorter and clearer for every real case we tried; a DSL only earns its keep once non-Rust authorship or hot-reload becomes a concrete need.
 
+That said, most adapters converge on the same shape: a regex table, `$1` substitution, flat sequential phases, a multi-line block or two, and an on-exit error fallback. The optional `interpret` feature factors *that shape* out as a native-Rust helper — the `rules!` macro plus `RuleInterpreter` (see [`src/interpret.rs`](src/interpret.rs)). It is still ordinary Rust source (patterns and templates are string literals in your crate), not a data DSL, and it's opt-in: hand-writing the trait remains fully supported and the two compose.
+
 ---
 
 ## Versioning

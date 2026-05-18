@@ -706,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "execra"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "flate2",
  "futures-core",
